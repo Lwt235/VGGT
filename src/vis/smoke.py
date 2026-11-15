@@ -249,6 +249,8 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
     error_before = np.linalg.norm(before-target_points, axis=-1)
     error_after = np.linalg.norm(after-target_points, axis=-1)
     error_delta = error_after-error_before
+    rotation_change, translation_change = pose_errors(erased['T1'], full['T1'])
+    rotation0_change, translation0_change = pose_errors(erased['T0'], full['T0'])
     local = ((target_points >= lower) & (target_points <= upper)).all(-1) & valid
     outside = valid & ~local
     fig = plt.figure(figsize=(15, 4), layout="constrained")
@@ -283,10 +285,9 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
     ax.axis("off")
     fig.colorbar(heat, ax=ax, fraction=.05)
     fig.suptitle(f"V5 · {scene['name']} · 3D bbox intervention, zero retraining, fixed model")
-    fig.supxlabel(f"EPE increase inside/outside = {error_delta[local].mean():+.4f}/{error_delta[outside].mean():+.4f} m; full camera prediction is allowed to change", fontsize=10)
+    fig.supxlabel(f"EPE increase inside/outside = {error_delta[local].mean():+.4f}/{error_delta[outside].mean():+.4f} m; "
+                  f"normal T0 change {100*float(translation0_change):.2f} cm / {float(rotation0_change):.2f} deg; free camera prediction", fontsize=10)
     save(fig, folder/"V5_local_erasure.png")
-    rotation_change, translation_change = pose_errors(erased["T1"], full["T1"])
-    rotation0_change, translation0_change = pose_errors(erased['T0'], full['T0'])
     result = {"erased_count": int(mask.sum()), "local_pixels": int(local.sum()),
             "mean_change_inside_m": float(delta[local].mean()) if local.any() else None,
             "mean_change_outside_m": float(delta[outside].mean()) if outside.any() else None,

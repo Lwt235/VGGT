@@ -96,6 +96,11 @@ def main():
         rot, trans = pose_errors(Tpartial, Tfull)
         residual = (anchors-transform_points(camera, baseline)).norm(dim=-1)
         anchor_change = (after['anchors']-anchors).norm(dim=-1)
+        world_direction = rays @ baseline[:3, :3].T
+        world_delta = anchors-baseline[:3, 3]
+        ray_depth = (world_direction*world_delta).sum(-1)
+        lateral_residual = (world_delta-ray_depth[:, None]*world_direction).norm(dim=-1)
+        radial_residual = (ray_depth-camera.norm(dim=-1)).abs()
         def masked_mean(value, mask):
             return float(value[mask].mean()) if mask.any() else None
         report[scene['name']] = dict(
@@ -108,6 +113,11 @@ def main():
             lost_patch_anchor_change_m=masked_mean(anchor_change, lost),
             kept_patch_baseline_rigid_residual_m=masked_mean(residual, kept),
             lost_patch_baseline_rigid_residual_m=masked_mean(residual, lost),
+            kept_patch_lateral_residual_m=masked_mean(lateral_residual, kept),
+            kept_patch_radial_residual_m=masked_mean(radial_residual, kept),
+            lost_patch_lateral_residual_m=masked_mean(lateral_residual, lost),
+            lost_patch_radial_residual_m=masked_mean(radial_residual, lost),
+            lost_patch_final_robust_vote_fraction=float(after['anchor_votes'][lost].sum()/after['anchor_votes'].sum().clamp_min(1e-8)),
             pre_injection_camera_point_max_change_m=float((camera-after['camera_patch_points']).abs().max()),
             moment_pose_changes=moments,
             exact_correspondence_control=dict(rotation_change_deg=float(rot), translation_change_m=float(trans)))
