@@ -105,21 +105,28 @@ class SpatialBootstrap(nn.Module):
 
 
 class SpatialRefinement(nn.Module):
-    def __init__(self, token_dim=2048, *, direct_residual=True):
+    def __init__(self, token_dim=2048, *, direct_residual=True, residual_only=False):
         super().__init__()
         self.token_project = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, 32), nn.GELU())
         # camera point, rendered point in T0 camera, metric residual, ray, O, var
         self.spatial = nn.Sequential(nn.Conv2d(46, 64, 3, padding=1), nn.GELU(), nn.Conv2d(64, 64, 3, padding=1), nn.GELU())
-        self.pose = PoseHead(64*4*5)
+        self.pose = None if residual_only else PoseHead(64*4*5)
+        self.residual_only = residual_only
+        self.residual_modulator = None
+        if residual_only:
+            self.residual_modulator = nn.Linear(64*4*5, 3*4*5)
+            nn.init.zeros_(self.residual_modulator.weight)
+            nn.init.zeros_(self.residual_modulator.bias)
         self.residual_pose = None
         if direct_residual:
             # Preserve metric residual amplitude. A LayerNorm over the entire
             # appearance/geometry embedding can suppress a 5 cm displacement.
             # This is a learned spatial linear layer, not a pose fitting solver.
-            self.residual_pose = nn.Linear(3*4*5, 9)
+            self.residual_pose = nn.Linear(3*4*5, 9, bias=not residual_only)
             nn.init.zeros_(self.residual_pose.weight)
-            with torch.no_grad():
-                self.residual_pose.bias.copy_(torch.tensor([1., 0., 0., 0., 1., 0., 0., 0., 0.]))
+            if not residual_only:
+                with torch.no_grad():
+                    self.residual_pose.bias.copy_(torch.tensor([1., 0., 0., 0., 1., 0., 0., 0., 0.]))
 
     def forward(self, tokens, camera_points, T0, rendered, K, height, width):
         camera_patch = F.adaptive_avg_pool2d(camera_points.permute(2, 0, 1)[None], (height, width))[0].permute(1, 2, 0).reshape(-1, 3)
@@ -134,9 +141,22 @@ class SpatialRefinement(nn.Module):
                               torch.log1p(rendered.depth_variance.reshape(-1, 1))), -1)
         inputs = torch.cat((self.token_project(tokens), geometry), -1).T.reshape(1, 46, height, width)
         spatial = F.adaptive_avg_pool2d(self.spatial(inputs), (4, 5)).flatten()
-        delta = self.pose(spatial)
+        delta = torch.eye(4, device=K.device, dtype=K.dtype) if self.pose is None else self.pose(spatial)
         if self.residual_pose is not None:
-            residual_grid = (residual_local/.1).T.reshape(1, 3, height, width)
-            value = self.residual_pose(F.adaptive_avg_pool2d(residual_grid, (4, 5)).flatten())
+            pose_residual = residual_local
+            if self.residual_only:
+                # Mixed depth layers and large correspondence errors should not
+                # dominate one global camera correction. Context may reweight
+                # these metric residuals, but cannot invent a pose on its own.
+                variance_weight = 1/(1+rendered.depth_variance.reshape(-1, 1)/.01)
+                robust_weight = .2/torch.sqrt(residual_local.square().sum(-1, keepdim=True)+.04)
+                pose_residual = pose_residual*variance_weight*robust_weight
+            residual_grid = (pose_residual/.1).T.reshape(1, 3, height, width)
+            residual_vector = F.adaptive_avg_pool2d(residual_grid, (4, 5)).flatten()
+            if self.residual_modulator is not None:
+                residual_vector = residual_vector*(1+.5*self.residual_modulator(spatial).tanh())
+            value = self.residual_pose(residual_vector)
+            if self.residual_only:
+                value = value+value.new_tensor([1., 0., 0., 0., 1., 0., 0., 0., 0.])
             delta = delta @ pose_from_vector(value)
         return fixed @ delta, X_T0.reshape(height, width, 3), residual_world.reshape(height, width, 3)

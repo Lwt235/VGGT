@@ -89,7 +89,7 @@ class VGGTSpatialMemory(nn.Module):
         self.native.point_head.requires_grad_(True)
         self.native.aggregator.global_blocks[receive_layer].requires_grad_(True)
         self.receive_layer = receive_layer
-        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h'):
+        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h', 'v2i'):
             raise ValueError('Unknown model revision')
         self.revision = revision
         self.pose_jitter_probability = pose_jitter_probability
@@ -97,8 +97,8 @@ class VGGTSpatialMemory(nn.Module):
         self.fusion = SpatialMomentFusion()
         self.render_reader = RenderReader(metric_depth=revision!='v2')
         self.pe_reader = ParameterPEReader(opacity_occlusion=revision!='v2')
-        self.initial_pose = SpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h'))
-        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h'))
+        self.initial_pose = SpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
+        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i'), residual_only=revision=='v2i')
 
     def train(self, mode=True):
         super().train(mode)
@@ -124,7 +124,7 @@ class VGGTSpatialMemory(nn.Module):
                                   for key in ("means", "covars", "alpha", "features")))
         # No image/token fields leave this function. Autograd retains only what
         # the current training step requires, never a subsequent query bypass.
-        reference = mapping_observations[0][1].c2w if self.revision == 'v2h' else None
+        reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i') else None
         return self.fusion(memory, reference_c2w=reference)
 
     def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False):

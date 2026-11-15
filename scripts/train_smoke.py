@@ -101,11 +101,19 @@ def main():
             raise ValueError('Warm start must be from this new project, not historical sessions')
         previous = load_checkpoint_readonly(origin)
         parameters = dict(model.named_parameters())
+        retired = []
         with torch.no_grad():
             for name, value in previous['trainable'].items():
+                if name not in parameters:
+                    if config.get('architecture_revision') != 'v2i' or not (name.startswith('refine_pose.pose.') or name == 'refine_pose.residual_pose.bias'):
+                        raise ValueError(f'Unexpected incompatible checkpoint parameter: {name}')
+                    retired.append(name)
+                    continue
                 parameters[name].copy_(value)
         added = sorted(set(n for n,p in parameters.items() if p.requires_grad)-set(previous['trainable']))
         print('Warm start from own-project checkpoint; newly initialized:', added, flush=True)
+        if retired:
+            print('Retired architecture parameters:', retired, flush=True)
         del previous
     samples = load_scene_samples(config, "cuda")
     residual_params = list(model.refine_pose.residual_pose.parameters()) if model.refine_pose.residual_pose is not None else []
@@ -151,7 +159,9 @@ def main():
             memory.retain_grad()
             prediction = model(query, memory)
             loss, metrics = world_loss(prediction, target, camera_weight=config.get('camera_alignment_weight', .5),
-                                       refinement_safety_weight=config.get('refinement_safety_weight', 0.))
+                                       refinement_safety_weight=config.get('refinement_safety_weight', 0.),
+                                       anchor_weight=config.get('anchor_alignment_weight', .2),
+                                       matching_weight=config.get('matching_weight', .2))
             if config.get('mapping_self_observation'):
                 mapping_loss, mapping_metrics = supervise_mapping_observation(model, memory, mapping[(step//3) % len(mapping)])
                 loss = loss+mapping_loss
@@ -226,7 +236,8 @@ def main():
         from src.vis.smoke import deliver_visualizations
         model.eval()
         deliver_visualizations(model, samples, output_dir, records, camera_weight=config.get('camera_alignment_weight', .5),
-                               refinement_safety_weight=config.get('refinement_safety_weight', 0.))
+                               refinement_safety_weight=config.get('refinement_safety_weight', 0.),
+                               anchor_weight=config.get('anchor_alignment_weight', .2), matching_weight=config.get('matching_weight', .2))
 
 
 if __name__ == "__main__":

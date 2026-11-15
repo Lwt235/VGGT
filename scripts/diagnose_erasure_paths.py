@@ -18,6 +18,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scripts.train_smoke import load_scene_samples
 from src.models.vggt_memory import VGGTSpatialMemory
+from src.losses.world import pose_errors
+from torch.nn import functional as F
 
 
 @torch.no_grad()
@@ -44,6 +46,14 @@ def main():
         query, target = scene['queries'][1]
         memory = model.build_memory(scene['mapping'])
         full = model(query, memory)
+        bootstrap = full['bootstrap_attention']
+        hp, wp = query.rgb.shape[-2]//14, query.rgb.shape[-1]//14
+        fraction = F.adaptive_avg_pool2d(target.valid.float()[None, None], (hp, wp))[0, 0]
+        world = F.adaptive_avg_pool2d((target.world_points*target.valid[..., None]).permute(2, 0, 1)[None], (hp, wp))[0].permute(1, 2, 0)/fraction.clamp_min(1e-6)[..., None]
+        difference = world.reshape(-1, 3)[:, None]-memory.means[None]
+        rho2 = torch.einsum('qmi,mij,qmj->qm', difference, torch.linalg.inv(memory.covars), difference)
+        supported = (rho2.min(-1).values <= 9.) & (fraction.flatten() > .25)
+        neighboring = rho2 <= 9.
         box = evaluation[scene['name']]['erasure']
         lower, upper = [memory.means.new_tensor(box[key]) for key in ('box_lower', 'box_upper')]
         erased, mask = memory.erase_box(lower, upper)
@@ -63,12 +73,21 @@ def main():
                 hook1.remove()
         finally:
             hook0.remove()
-        report[scene['name']] = {}
+        report[scene['name']] = {'bootstrap_diagnostic': dict(
+            normalized_entropy=float((-(bootstrap*bootstrap.clamp_min(1e-9).log()).sum(-1)/np.log(len(memory))).mean()),
+            supported_patch_fraction=float(supported.float().mean()),
+            matching_mass_in_supported_3sigma=float((bootstrap*neighboring).sum(-1)[supported].mean()),
+            uniform_mass_in_supported_3sigma=float(neighboring.float().mean(-1)[supported].mean()),
+            anchor_error_supported_m=float((full['anchors']-world.reshape(-1, 3)).norm(dim=-1)[supported].mean()),
+            erased_key_mass_mean=float(bootstrap[:, mask].sum(-1).mean()))}
         for column, (label, prediction) in enumerate(predictions):
             change = (prediction['world_points']-target.world_points).norm(dim=-1)-before
             inside_value, outside_value = float(change[local].mean()), float(change[outside].mean())
             report[scene['name']][label] = dict(epe_increase_inside_m=inside_value, epe_increase_outside_m=outside_value,
-                                               translation_change_m=float((prediction['T1'][:3, 3]-full['T1'][:3, 3]).norm()))
+                                               translation_change_m=float((prediction['T1'][:3, 3]-full['T1'][:3, 3]).norm()),
+                                               rotation0_change_deg=float(pose_errors(prediction['T0'], full['T0'])[0]),
+                                               translation0_change_m=float(pose_errors(prediction['T0'], full['T0'])[1]),
+                                               anchor_change_mean_m=float((prediction['anchors']-full['anchors']).norm(dim=-1).mean()))
             heat = change.cpu().numpy()
             valid = target.valid.cpu().numpy()
             ax = axes[row, column]

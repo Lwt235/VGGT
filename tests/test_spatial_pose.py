@@ -108,3 +108,28 @@ def test_ambiguous_spatial_matches_have_less_influence_on_world_pose():
     votes.sum().backward()
     assert torch.isfinite(means.grad).all() and means.grad.abs().sum() > 0
     assert torch.isfinite(covars.grad).all() and covars.grad.abs().sum() > 0
+
+
+def test_learned_refinement_cannot_guess_a_pose_without_alignment_residual():
+    torch.manual_seed(17)
+    model = SpatialRefinement(token_dim=16, residual_only=True)
+    with torch.no_grad():
+        model.residual_pose.weight.normal_(std=.02)
+        model.residual_modulator.weight.normal_(std=.001)
+    points = torch.randn(28, 42, 3, requires_grad=True)
+    patch = torch.nn.functional.adaptive_avg_pool2d(points.permute(2, 0, 1)[None], (2, 3))[0].permute(1, 2, 0)
+    rendered = RenderedMemory(patch.detach().clone(), torch.randn(2, 3, 8), torch.ones(2, 3, 1),
+                              torch.ones(2, 3, 1)*.01, torch.ones(2, 3, 1))
+    T0 = torch.eye(4, requires_grad=True)
+    T1, _, _ = model(torch.randn(6, 16), points, T0, rendered, torch.eye(3), 2, 3)
+    torch.testing.assert_close(T1, T0, atol=1e-6, rtol=1e-6)
+    rendered.world[..., 0] += .05
+    changed, _, _ = model(torch.randn(6, 16), points, T0, rendered, torch.eye(3), 2, 3)
+    assert (changed-T0).abs().max() > 1e-4
+    changed[:3, 3].square().sum().backward()
+    assert T0.grad is None
+    assert model.residual_pose.weight.grad.abs().sum() > 0
+    assert model.residual_modulator.weight.grad.abs().sum() > 0
+    rendered.opacity.zero_()
+    unseen, _, _ = model(torch.randn(6, 16), points, T0, rendered, torch.eye(3), 2, 3)
+    torch.testing.assert_close(unseen, T0, atol=1e-6, rtol=1e-6)

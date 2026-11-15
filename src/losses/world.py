@@ -21,7 +21,7 @@ def pose_errors(prediction, target):
     return degrees, translation
 
 
-def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.):
+def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2):
     valid = target.valid
     if not valid.any():
         raise ValueError("No valid metric supervision pixels")
@@ -60,7 +60,7 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.)
     t0_error = (coarse[:3, 3]-target.c2w[:3, 3]).norm()
     t1_error = (refined[:3, 3]-target.c2w[:3, 3]).norm()
     safety = F.relu(r1_angle-r0_angle.detach())+F.relu(t1_error-t0_error.detach())
-    loss = point + .25*coarse_point + pose + .2*anchor + .2*match + camera_weight*camera_alignment
+    loss = point + .25*coarse_point + pose + anchor_weight*anchor + matching_weight*match + camera_weight*camera_alignment
     loss = loss+refinement_safety_weight*safety
     with torch.no_grad():
         r0, t0 = pose_errors(coarse, target.c2w)
