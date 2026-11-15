@@ -21,6 +21,7 @@ class SpatialBootstrap(nn.Module):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
         self.log_temperature = nn.Parameter(torch.tensor(math.log(20.)))
+        self.key_dropout_mode = 'independent'
         self.patch_features = nn.Sequential(nn.LayerNorm(token_dim+5), nn.Linear(token_dim+5, 64), nn.GELU())
         self.coefficients = nn.Linear(64, 3)
         nn.init.zeros_(self.coefficients.weight)
@@ -54,6 +55,13 @@ class SpatialBootstrap(nn.Module):
             # Global localization must tolerate small missing map subsets.
             # O5/O6 still read the full map; this is bootstrap key dropout.
             support = torch.rand(len(memory), device=tokens.device) > .1
+            if self.key_dropout_mode == 'spatial':
+                center_index = torch.randint(len(memory), (), device=tokens.device)
+                spatial_support = ((memory.means.detach()-memory.means.detach()[center_index]).abs() > .5).any(-1)
+                # A local dropout regularizer; never remove most of a map or
+                # alter the stored memory / the O5 and O6 read paths.
+                if spatial_support.sum() >= len(memory)*.5:
+                    support = spatial_support
             support[0] = True
             logits = logits.masked_fill(~support[None], float('-inf'))
         weights = logits.softmax(-1)

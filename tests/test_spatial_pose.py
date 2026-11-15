@@ -40,6 +40,11 @@ def test_random_world_gauge_changes_only_supervision_and_transports_bootstrap():
     transported = GaussianMemory(transform_points(memory.means, G), G[:3, :3]@memory.covars@G[:3, :3].T,
                                  memory.alpha, memory.features)
     model = SpatialBootstrap(dim, 8).eval()
+    # Exercise learned geometric/context corrections, not only their initial
+    # zero/identity values, under an arbitrary world gauge.
+    with torch.no_grad():
+        model.geometry_context.weight.normal_(std=.002)
+        model.local_rotation[-1].weight.normal_(std=.002)
     tokens, features = torch.randn(h*w, dim), torch.randn(h*w, 8)
     T, _ = model(tokens, features, memory, K, h, w)
     TG, _ = model(tokens, features, transported, K, h, w)

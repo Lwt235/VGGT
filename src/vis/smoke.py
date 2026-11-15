@@ -300,12 +300,12 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
 
 
 @torch.no_grad()
-def deliver_visualizations(model, samples, output_dir, records, *, camera_weight=.5):
+def deliver_visualizations(model, samples, output_dir, records, *, camera_weight=.5, refinement_safety_weight=0.):
     folder = output_dir/"vis"
     folder.mkdir(parents=True, exist_ok=True)
     all_metrics = {}
     def criterion(prediction, target):
-        return world_loss(prediction, target, camera_weight=camera_weight)
+        return world_loss(prediction, target, camera_weight=camera_weight, refinement_safety_weight=refinement_safety_weight)
     for scene in samples:
         scene_folder = folder/scene["name"]
         scene_folder.mkdir(exist_ok=True)

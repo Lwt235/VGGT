@@ -93,6 +93,7 @@ def main():
     model = VGGTSpatialMemory(runtime["assets"]["official_vggt_source"]["path"], weights,
                                receive_layer=config["receive_layer"], revision=config.get('architecture_revision', 'v2'),
                                pose_jitter_probability=config.get('pose_jitter_probability', 1.)).cuda().train()
+    model.initial_pose.key_dropout_mode = config.get('bootstrap_key_dropout', 'independent')
     if config.get('initialize_from'):
         origin = (PROJECT_ROOT/config['initialize_from']).resolve()
         if not origin.is_relative_to(PROJECT_ROOT/'results'):
@@ -141,7 +142,8 @@ def main():
             memory = model.build_memory(mapping)
             memory.retain_grad()
             prediction = model(query, memory)
-            loss, metrics = world_loss(prediction, target, camera_weight=config.get('camera_alignment_weight', .5))
+            loss, metrics = world_loss(prediction, target, camera_weight=config.get('camera_alignment_weight', .5),
+                                       refinement_safety_weight=config.get('refinement_safety_weight', 0.))
             if config.get('mapping_self_observation'):
                 mapping_loss, mapping_metrics = supervise_mapping_observation(model, memory, mapping[(step//3) % len(mapping)])
                 loss = loss+mapping_loss
@@ -195,7 +197,8 @@ def main():
     if not args.diagnostic:
         from src.vis.smoke import deliver_visualizations
         model.eval()
-        deliver_visualizations(model, samples, output_dir, records, camera_weight=config.get('camera_alignment_weight', .5))
+        deliver_visualizations(model, samples, output_dir, records, camera_weight=config.get('camera_alignment_weight', .5),
+                               refinement_safety_weight=config.get('refinement_safety_weight', 0.))
 
 
 if __name__ == "__main__":

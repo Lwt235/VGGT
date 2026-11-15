@@ -21,7 +21,7 @@ def pose_errors(prediction, target):
     return degrees, translation
 
 
-def world_loss(output, target, *, camera_weight=.5):
+def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.):
     valid = target.valid
     if not valid.any():
         raise ValueError("No valid metric supervision pixels")
@@ -53,7 +53,15 @@ def world_loss(output, target, *, camera_weight=.5):
     anchor = (output['anchors'][anchor_mask]-world_patch.reshape(-1, 3)[anchor_mask]).abs().mean() if anchor_mask.any() else point*0.
     camera_truth = transform_points(target.world_points, invert_se3(target.c2w))
     camera_alignment = (output['camera_points'][valid]-camera_truth[valid]).abs().mean()
+    # Training supervision only: the reference is detached, so this cannot
+    # reward making T0 worse. Inference always returns the predicted T1.
+    r0_angle = rotation_geodesic(coarse[:3, :3], target.c2w[:3, :3])
+    r1_angle = rotation_geodesic(refined[:3, :3], target.c2w[:3, :3])
+    t0_error = (coarse[:3, 3]-target.c2w[:3, 3]).norm()
+    t1_error = (refined[:3, 3]-target.c2w[:3, 3]).norm()
+    safety = F.relu(r1_angle-r0_angle.detach())+F.relu(t1_error-t0_error.detach())
     loss = point + .25*coarse_point + pose + .2*anchor + .2*match + camera_weight*camera_alignment
+    loss = loss+refinement_safety_weight*safety
     with torch.no_grad():
         r0, t0 = pose_errors(coarse, target.c2w)
         r1, t1 = pose_errors(refined, target.c2w)
@@ -61,6 +69,7 @@ def world_loss(output, target, *, camera_weight=.5):
                   "point_epe_m": delta.detach().norm(dim=-1).mean().item(),
                   "coarse_point_l1_m": coarse_point.detach().item(), "anchor_l1_m": anchor.detach().item(),
                   "camera_alignment_l1_m": camera_alignment.detach().item(), "correspondence_loss": match.detach().item(),
+                  "refinement_regression_penalty": safety.detach().item(),
                   "coarse_point_epe_m": (output['coarse_world_points'][valid]-target.world_points[valid]).detach().norm(dim=-1).mean().item(),
                   "rotation0_deg": r0.item(), "rotation1_deg": r1.item(),
                   "translation0_m": t0.item(), "translation1_m": t1.item()}

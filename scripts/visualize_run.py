@@ -43,7 +43,8 @@ def main():
             parameters[name].copy_(value)
     records = [json.loads(line) for line in (run/"metrics.jsonl").read_text().splitlines()]
     samples = load_scene_samples(checkpoint["config"], "cuda")
-    deliver_visualizations(model, samples, run, records, camera_weight=checkpoint['config'].get('camera_alignment_weight', .5))
+    deliver_visualizations(model, samples, run, records, camera_weight=checkpoint['config'].get('camera_alignment_weight', .5),
+                           refinement_safety_weight=checkpoint['config'].get('refinement_safety_weight', 0.))
 
 
 if __name__ == "__main__":
