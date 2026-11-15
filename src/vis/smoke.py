@@ -406,6 +406,7 @@ def gate_statistics(gate):
 
 def plot_training_curves(output_dir, records):
     fig, grid = plt.subplots(2, 3, figsize=(14, 7), layout="constrained")
+    fig.suptitle('Training poses include configured T0 perturbations / key dropout; final evaluation uses neither', fontsize=10)
     axes = grid.flatten()
     palette = ["#0072b2", "#d55e00", "#009e73"]
     for index, name in enumerate(dict.fromkeys(record["scene"] for record in records)):

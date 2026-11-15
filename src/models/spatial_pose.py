@@ -51,7 +51,7 @@ class SpatialBootstrap(nn.Module):
         k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
         logits = q @ k.T * self.log_temperature.exp().clamp(max=60.) + memory.alpha.clamp_min(1e-6).log()[None]
         support = torch.ones(len(memory), dtype=torch.bool, device=tokens.device)
-        if self.training and self.local_rotation is not None:
+        if self.training and self.local_rotation is not None and self.key_dropout_mode != 'none':
             # Global localization must tolerate small missing map subsets.
             # O5/O6 still read the full map; this is bootstrap key dropout.
             support = torch.rand(len(memory), device=tokens.device) > .1

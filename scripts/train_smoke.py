@@ -23,6 +23,7 @@ from src.data import QueryInput, Sun3DScene, Supervision
 from src.augmentation import augment_training_world
 from src.losses.world import world_loss
 from src.losses.mapping import supervise_mapping_observation
+from src.losses.pose_consistency import pose_consistency_loss
 from src.models.vggt_memory import VGGTSpatialMemory
 
 
@@ -152,6 +153,26 @@ def main():
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Nonfinite loss at step {step}; training stopped")
             loss.backward()
+            # Sequential backwards avoid retaining two native VGGT graphs.
+            # Only pose is supervised on this partial-map branch; it is NOT
+            # trained to invent missing local geometry or to create degradation.
+            if config.get('paired_pose_consistency') and (step//3) % 2 == 0:
+                teacher = {key: prediction[key].detach() for key in ('T0', 'T1')}
+                probability = prediction['bootstrap_attention'].detach().mean(0)
+                index = torch.multinomial(probability+.001, 1)[0]
+                center = memory.means[index].detach()
+                partial_memory = model.build_memory(mapping)
+                partial_memory, erased_mask = partial_memory.erase_box(center-.5, center+.5)
+                if len(partial_memory) >= len(memory)*.5 and erased_mask.any():
+                    partial_prediction = model(query, partial_memory)
+                    consistency, consistency_metrics = pose_consistency_loss(partial_prediction, teacher, target)
+                    if not torch.isfinite(consistency):
+                        raise RuntimeError('Nonfinite paired pose consistency')
+                    consistency.backward()
+                    metrics.update(consistency_metrics)
+                    metrics['loss'] += float(consistency.detach())
+                    del partial_prediction, consistency
+                del partial_memory
             norms = {name: gradient_norm(module) for name, module in modules.items()}
             state_norms = {name: float(value.grad.norm()) if value.grad is not None else 0.
                            for name, value in zip(("mu", "Sigma", "alpha", "z"),
