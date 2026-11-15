@@ -1,0 +1,25 @@
+seed: 17
+architecture_revision: v2c
+steps: 1200
+image_hw: [112, 140]
+receive_layer: 4
+mapping_indices: [0, 2, 4]
+query_indices: [1, 3, 5]
+heldout_query_indices: [6]
+optimizer:
+  heads_lr: 0.0001
+  pose_lr: 0.0001
+  gate_lr: 0.001
+  refinement_geometry_lr: 0.0005
+  native_lr: 0.000003
+  warmup_steps: 30
+  grad_clip: 5.0
+initialize_from: results/smoke_seed17_v2c/trainable.pt
+camera_alignment_weight: 2.
+mapping_self_observation: true
+world_augmentation: uniform_SO3_translation_plus_minus_3m
+predicted_pose_jitter: local_quaternion_xyz_std_0.015_translation_std_0.08m_training_only
+pose_jitter_probability: 0.5
+log_every: 20
+checkpoint_every: 300
+description: Full system continuation of v2c; repair opacity collapse with permitted mapping RGB-D self-observation, and improve camera-point calibration. No query GT initialization, same split, no component ablation.

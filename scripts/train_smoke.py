@@ -22,6 +22,7 @@ import yaml
 from src.data import QueryInput, Sun3DScene, Supervision
 from src.augmentation import augment_training_world
 from src.losses.world import world_loss
+from src.losses.mapping import supervise_mapping_observation
 from src.models.vggt_memory import VGGTSpatialMemory
 
 
@@ -90,7 +91,8 @@ def main():
     (output_dir/"config.yaml").write_text(yaml.safe_dump(dict(config, steps=steps, diagnostic=args.diagnostic), sort_keys=False))
     print("Loading complete official VGGT/DINOv2/DPT checkpoint (read-only)", flush=True)
     model = VGGTSpatialMemory(runtime["assets"]["official_vggt_source"]["path"], weights,
-                               receive_layer=config["receive_layer"], revision=config.get('architecture_revision', 'v2')).cuda().train()
+                               receive_layer=config["receive_layer"], revision=config.get('architecture_revision', 'v2'),
+                               pose_jitter_probability=config.get('pose_jitter_probability', 1.)).cuda().train()
     if config.get('initialize_from'):
         origin = (PROJECT_ROOT/config['initialize_from']).resolve()
         if not origin.is_relative_to(PROJECT_ROOT/'results'):
@@ -139,7 +141,12 @@ def main():
             memory = model.build_memory(mapping)
             memory.retain_grad()
             prediction = model(query, memory)
-            loss, metrics = world_loss(prediction, target)
+            loss, metrics = world_loss(prediction, target, camera_weight=config.get('camera_alignment_weight', .5))
+            if config.get('mapping_self_observation'):
+                mapping_loss, mapping_metrics = supervise_mapping_observation(model, memory, mapping[(step//3) % len(mapping)])
+                loss = loss+mapping_loss
+                metrics.update(mapping_metrics)
+                metrics['loss'] = float(loss.detach())
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Nonfinite loss at step {step}; training stopped")
             loss.backward()
@@ -188,7 +195,7 @@ def main():
     if not args.diagnostic:
         from src.vis.smoke import deliver_visualizations
         model.eval()
-        deliver_visualizations(model, samples, output_dir, records)
+        deliver_visualizations(model, samples, output_dir, records, camera_weight=config.get('camera_alignment_weight', .5))
 
 
 if __name__ == "__main__":

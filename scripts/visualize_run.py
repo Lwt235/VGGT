@@ -32,7 +32,8 @@ def main():
     runtime = load_config()
     model = VGGTSpatialMemory(runtime["assets"]["official_vggt_source"]["path"],
                                checkpoint["weight_source"], receive_layer=checkpoint["config"]["receive_layer"],
-                               revision=checkpoint['config'].get('architecture_revision', 'v2')).cuda().eval()
+                               revision=checkpoint['config'].get('architecture_revision', 'v2'),
+                               pose_jitter_probability=checkpoint['config'].get('pose_jitter_probability', 1.)).cuda().eval()
     parameters = dict(model.named_parameters())
     expected = {name for name, p in parameters.items() if p.requires_grad}
     if expected != set(checkpoint["trainable"]):
@@ -42,7 +43,7 @@ def main():
             parameters[name].copy_(value)
     records = [json.loads(line) for line in (run/"metrics.jsonl").read_text().splitlines()]
     samples = load_scene_samples(checkpoint["config"], "cuda")
-    deliver_visualizations(model, samples, run, records)
+    deliver_visualizations(model, samples, run, records, camera_weight=checkpoint['config'].get('camera_alignment_weight', .5))
 
 
 if __name__ == "__main__":

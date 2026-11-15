@@ -69,7 +69,7 @@ def aggregate_single(aggregator, rgb, patch_tokens, injection=None, receive_laye
 
 
 class VGGTSpatialMemory(nn.Module):
-    def __init__(self, source, weights, *, receive_layer=4, revision='v2c'):
+    def __init__(self, source, weights, *, receive_layer=4, revision='v2c', pose_jitter_probability=1.):
         super().__init__()
         # No random fallback or automatic download: missing weights stop here.
         if weights is None or not Path(weights).is_file():
@@ -92,6 +92,7 @@ class VGGTSpatialMemory(nn.Module):
         if revision not in ('v2', 'v2b', 'v2c'):
             raise ValueError('Unknown model revision')
         self.revision = revision
+        self.pose_jitter_probability = pose_jitter_probability
         self.writer = TokenGaussianWriter(1024)
         self.fusion = SpatialMomentFusion()
         self.render_reader = RenderReader(metric_depth=revision!='v2')
@@ -134,7 +135,7 @@ class VGGTSpatialMemory(nn.Module):
         shallow = frozen_patch_tokens(self.native.aggregator, rgb)
         Kp = patch_intrinsics(K)
         T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
-        if self.training and self.revision != 'v2':
+        if self.training and self.revision != 'v2' and torch.rand((), device=rgb.device) < self.pose_jitter_probability:
             # Predicted-pose denoising: stochastic small *local* perturbations,
             # independent of GT, teach the residual head a stationary signal.
             from src.geometry import quat_wxyz_to_matrix

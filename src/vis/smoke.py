@@ -197,6 +197,9 @@ def v3(folder, scene, query, target, full, empty, render0, render1):
     axes[3].legend(fontsize=6)
     axes[3].set_aspect("equal", adjustable="datalim")
     fig.suptitle(f"V3 · {scene['name']} · geometric display render 112x140; trained read 8x10; no RGB memory")
+    r0, t0 = pose_errors(full['T0'], target.c2w)
+    r1, t1 = pose_errors(full['T1'], target.c2w)
+    fig.supxlabel(f"Predicted pose only · R0→R1={float(r0):.2f}→{float(r1):.2f} deg; t0→t1={float(t0):.3f}→{float(t1):.3f} m", fontsize=10)
     save(fig, folder/"V3_bootstrap_calibration.png")
 
 
@@ -280,6 +283,7 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
     ax.axis("off")
     fig.colorbar(heat, ax=ax, fraction=.05)
     fig.suptitle(f"V5 · {scene['name']} · 3D bbox intervention, zero retraining, fixed model")
+    fig.supxlabel(f"EPE increase inside/outside = {error_delta[local].mean():+.4f}/{error_delta[outside].mean():+.4f} m; full camera prediction is allowed to change", fontsize=10)
     save(fig, folder/"V5_local_erasure.png")
     rotation_change, translation_change = pose_errors(erased["T1"], full["T1"])
     return {"erased_count": int(mask.sum()), "local_pixels": int(local.sum()),
@@ -296,10 +300,12 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
 
 
 @torch.no_grad()
-def deliver_visualizations(model, samples, output_dir, records):
+def deliver_visualizations(model, samples, output_dir, records, *, camera_weight=.5):
     folder = output_dir/"vis"
     folder.mkdir(parents=True, exist_ok=True)
     all_metrics = {}
+    def criterion(prediction, target):
+        return world_loss(prediction, target, camera_weight=camera_weight)
     for scene in samples:
         scene_folder = folder/scene["name"]
         scene_folder.mkdir(exist_ok=True)
@@ -324,9 +330,9 @@ def deliver_visualizations(model, samples, output_dir, records):
         box = (center-radius, center+radius)
         erased_memory, mask = memory.erase_box(*box)
         erased = model(query, erased_memory)
-        _, full_metrics = world_loss(full, target)
-        _, empty_metrics = world_loss(empty, target)
-        _, erased_metrics = world_loss(erased, target)
+        _, full_metrics = criterion(full, target)
+        _, empty_metrics = criterion(empty, target)
+        _, erased_metrics = criterion(erased, target)
         metrics = {"full": full_metrics, "empty_same_weights": empty_metrics, "erased_same_weights": erased_metrics}
         attention = full["attention"]["attention"]
         entropy = None
@@ -358,11 +364,11 @@ def deliver_visualizations(model, samples, output_dir, records):
         metrics["all_training_queries"] = []
         for query_index, (training_query, training_target) in enumerate(scene["queries"]):
             training_prediction = full if query_index == 1 else model(training_query, memory)
-            _, query_metrics = world_loss(training_prediction, training_target)
+            _, query_metrics = criterion(training_prediction, training_target)
             query_metrics['rotation_gain_deg'] = query_metrics['rotation0_deg']-query_metrics['rotation1_deg']
             query_metrics['translation_gain_m'] = query_metrics['translation0_m']-query_metrics['translation1_m']
             empty_prediction = empty if query_index == 1 else model(training_query, memory.subset(slice(0, 0)))
-            _, empty_query_metrics = world_loss(empty_prediction, training_target)
+            _, empty_query_metrics = criterion(empty_prediction, training_target)
             query_metrics['empty_epe_m'] = empty_query_metrics['point_epe_m']
             metrics["all_training_queries"].append(dict(query_index=query_index, **query_metrics))
         metrics["wall"] = v1(scene_folder, scene, query, target, full)
@@ -374,8 +380,18 @@ def deliver_visualizations(model, samples, output_dir, records):
             raise RuntimeError("Erasure bbox has no visible evaluation surface")
         # Same-scene held-out query is diagnostic, not disjoint-scene validation.
         heldout_query, heldout_target = scene["heldout"][0]
-        _, metrics["heldout_query_diagnostic"] = world_loss(model(heldout_query, memory), heldout_target)
-        _, metrics["heldout_empty_diagnostic"] = world_loss(model(heldout_query, memory.subset(slice(0, 0))), heldout_target)
+        _, metrics["heldout_query_diagnostic"] = criterion(model(heldout_query, memory), heldout_target)
+        _, metrics["heldout_empty_diagnostic"] = criterion(model(heldout_query, memory.subset(slice(0, 0))), heldout_target)
+        # Evaluator-only coverage of this final learned memory, separate from
+        # the initial native-resolution v1 read-only coverage diagnostic.
+        points = heldout_target.world_points[heldout_target.valid]
+        precision = torch.linalg.inv(memory.covars)
+        covered = 0
+        for start in range(0, len(points), 2048):
+            difference = points[start:start+2048, None]-memory.means[None]
+            rho2 = torch.einsum('pmi,mij,pmj->pm', difference, precision, difference)
+            covered += int((rho2 <= 9).any(-1).sum())
+        metrics['heldout_query_diagnostic']['final_memory_3sigma_coverage_smoke_resolution'] = covered/len(points)
         all_metrics[scene["name"]] = metrics
         print("Visualizations generated:", scene_folder, flush=True)
     plot_training_curves(output_dir, records)
@@ -416,4 +432,8 @@ def plot_training_curves(output_dir, records):
     axes[4].legend(fontsize=7)
     axes[5].plot([r['step'] for r in records], [r['min_covariance_eigenvalue'] for r in records], lw=.6)
     axes[5].set(title='Minimum covariance eigenvalue [m²]', xlabel='Total updates', yscale='log')
+    alpha_axes = axes[5].twinx()
+    alpha_axes.plot([r['step'] for r in records], [r['alpha_min'] for r in records], color='#d55e00', ls='--', lw=.6)
+    alpha_axes.plot([r['step'] for r in records], [r['alpha_max'] for r in records], color='#d55e00', lw=.6)
+    alpha_axes.set(ylabel='alpha min/max (orange)', ylim=(0, 1))
     save(fig, output_dir/"vis/training_curves.png")
