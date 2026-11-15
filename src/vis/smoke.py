@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import colors
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import torch
 
@@ -41,12 +42,18 @@ def ellipsoid(ax, mean, covariance, color, alpha, detail=10):
 
 
 def axes3d(ax):
-    ax.set_xlabel("world x [m]")
-    ax.set_ylabel("world z [m]")
-    ax.set_zlabel("-world y [m]")
+    ax.set_xlabel("world x [m]", fontsize=8, labelpad=2)
+    ax.set_ylabel("world z [m]", fontsize=8, labelpad=2)
+    ax.set_zlabel("")
+    # Keep the vertical coordinate label inside the axes: Matplotlib's 3D
+    # tight bounding box otherwise clips it on narrow physical-aspect panels.
+    ax.text2D(.03, .97, "vertical = -world y [m]", transform=ax.transAxes, va="top", fontsize=7)
     ax.view_init(elev=25, azim=-55)
     spans = [np.ptp(ax.get_xlim3d()), np.ptp(ax.get_ylim3d()), np.ptp(ax.get_zlim3d())]
     ax.set_box_aspect(np.maximum(spans, .1))
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.set_major_locator(MaxNLocator(3))
+    ax.tick_params(labelsize=7)
 
 
 def save(fig, path):
@@ -71,34 +78,51 @@ def v1(folder, scene, query, target, prediction):
     # Reference plane comes only from a fixed mapping-image wall ROI.
     _, reference = scene["mapping"][0]
     h, w = reference.depth.shape
-    roi = torch.zeros_like(reference.valid)
-    roi[h//5:3*h//5, 3*w//4:] = True
-    ref_wall = cloud(reference.world_points, roi & reference.valid)
-    if len(ref_wall) < 10:
-        ref_wall = historical
-    center = np.median(ref_wall, axis=0)
-    _, _, rotation = np.linalg.svd(ref_wall-center, full_matrices=False)
-    normal = rotation[-1]
     gt_world = array(target.world_points)
-    # Evaluate the corresponding reference plane neighborhood, using GT only as
-    # an evaluation mask. Output coordinates are never fitted or transformed.
-    selected = (np.abs((gt_world-center)@normal) < .15) & array(target.valid).astype(bool)
-    if selected.sum() < 10:
-        selected = np.zeros((h, w), dtype=bool)
-        selected[h//5:3*h//5, 3*w//4:] = True
-        selected &= array(target.valid).astype(bool)
+    # Select a sufficiently sampled vertical planar patch from mapping GT only.
+    # It is a fixed diagnostic plane, NEVER a transform fitted to predictions.
+    candidates = []
+    ref_points = array(reference.world_points)
+    ref_valid = array(reference.valid).astype(bool)
+    for row in range(3):
+        for col in range(4):
+            y0, y1, x0, x1 = row*h//4, (row+1)*h//4, col*w//4, (col+1)*w//4
+            patch = ref_points[y0:y1, x0:x1][ref_valid[y0:y1, x0:x1]]
+            if len(patch) < 40:
+                continue
+            origin = np.median(patch, axis=0)
+            _, _, basis = np.linalg.svd(patch-origin, full_matrices=False)
+            n = basis[-1]
+            if abs(n[1]) > .65:
+                continue  # exclude floor/table surfaces in the mapping gauge
+            overlap = (np.abs((gt_world-origin)@n) < .15) & array(target.valid).astype(bool)
+            if overlap.sum() < 100:
+                continue
+            thickness = np.ptp(np.quantile((patch-origin)@n, [.1, .9]))
+            candidates.append((thickness, patch, origin, n, overlap, [x0, y0, x1, y1]))
+    if not candidates:
+        raise RuntimeError("No adequately sampled vertical reference surface for wall cross-section")
+    _, ref_wall, center, normal, selected, rectangle = min(candidates, key=lambda item: item[0])
     ref_residual = (ref_wall-center)@normal
     pred_residual = (array(prediction["world_points"])[selected]-center)@normal
     ax = fig.add_subplot(133)
     ax.hist(ref_residual, bins=40, density=True, color=COLD, alpha=.6, label="Mapping reference ROI")
     ax.hist(pred_residual, bins=40, density=True, color=ORANGE, alpha=.6, label="Predicted overlap ROI")
     ax.set(xlabel="Signed distance to fixed reference plane [m]", ylabel="Density", title="Wall ROI cross-section (no output fitting)")
-    ax.legend(fontsize=7)
+    ax.legend(fontsize=7, loc="upper left")
+    inset = ax.inset_axes([.6, .65, .38, .3])
+    inset.imshow(np.clip(array(scene["mapping"][0][0].rgb).transpose(1, 2, 0), 0, 1))
+    from matplotlib.patches import Rectangle
+    x0, y0, x1, y1 = rectangle
+    inset.add_patch(Rectangle((x0, y0), x1-x0, y1-y0, fill=False, edgecolor="cyan", linewidth=1))
+    inset.axis("off")
+    inset.set_title("Fixed reference ROI", fontsize=6)
     fig.suptitle(f"V1 · {scene['name']} · direct metric world coordinates")
     save(fig, folder/"V1_world_overlap.png")
     return {"mapping_wall_p90_p10_m": float(np.ptp(np.quantile(ref_residual, [.1, .9]))),
             "predicted_wall_p90_p10_m": float(np.ptp(np.quantile(pred_residual, [.1, .9]))),
-            "wall_evaluation_pixels": int(selected.sum())}
+            "wall_evaluation_pixels": int(selected.sum()), "mapping_roi_xyxy": rectangle,
+            "reference_plane_center": center.tolist(), "reference_plane_normal": normal.tolist()}
 
 
 def v2(folder, scene, memory):
@@ -150,21 +174,21 @@ def calibration_panel(ax, rgb, rendered, title):
     ax.axis("off")
     inset = ax.inset_axes([.02, .02, .4, .32])
     inset.imshow(depth, cmap="viridis", vmin=0, vmax=6)
-    inset.set_title("Memory z [m]", fontsize=6)
+    inset.set_title("Memory z [m]", fontsize=6, color="white", backgroundcolor="black")
     inset.axis("off")
     inset = ax.inset_axes([.56, .02, .4, .32])
     inset.imshow(1-opacity, cmap="gray", vmin=0, vmax=1)
-    inset.set_title("Unseen 1-O", fontsize=6)
+    inset.set_title("Unseen 1-O", fontsize=6, color="white", backgroundcolor="black")
     inset.axis("off")
 
 
-def v3(folder, scene, query, target, full, empty, render1):
-    rgb = array(query.rgb).transpose(1, 2, 0)
+def v3(folder, scene, query, target, full, empty, render0, render1):
+    rgb = np.clip(array(query.rgb).transpose(1, 2, 0), 0, 1)
     fig, axes = plt.subplots(1, 4, figsize=(15, 4), layout="constrained")
     axes[0].imshow(rgb)
     axes[0].set_title("a · Actual query RGB")
     axes[0].axis("off")
-    calibration_panel(axes[1], rgb, full["rendered"], "b · T0: red=geometry edge; green=RGB edge")
+    calibration_panel(axes[1], rgb, render0, "b · T0: red=geometry edge; green=RGB edge")
     calibration_panel(axes[2], rgb, render1, "c · T1: same edge definitions")
     for output, color, label in ((empty, "#527bbe", "Empty memory / same weights"), (full, ORANGE, "Full memory")):
         p = cloud(output["world_points"], target.valid, 2500)
@@ -172,12 +196,12 @@ def v3(folder, scene, query, target, full, empty, render1):
     axes[3].set(xlabel="world x [m]", ylabel="world z [m]", title="d · World output comparison")
     axes[3].legend(fontsize=6)
     axes[3].set_aspect("equal", adjustable="datalim")
-    fig.suptitle(f"V3 · {scene['name']} · geometric renders only (no invented RGB memory)")
+    fig.suptitle(f"V3 · {scene['name']} · geometric display render 112x140; trained read 8x10; no RGB memory")
     save(fig, folder/"V3_bootstrap_calibration.png")
 
 
 def v4(folder, scene, query, memory, prediction, layer):
-    rgb = array(query.rgb).transpose(1, 2, 0)
+    rgb = np.clip(array(query.rgb).transpose(1, 2, 0), 0, 1)
     hp, wp = rgb.shape[0]//14, rgb.shape[1]//14
     selection = [(hp//2, wp//4), (hp//2, wp//2), (hp//2, wp-2)]
     info = prediction["attention"]
@@ -207,6 +231,8 @@ def v4(folder, scene, query, memory, prediction, layer):
                 ellipsoid(ax, means[actual_idx], covars[actual_idx], plt.cm.inferno(heat), .3+.4*heat, detail=8)
     axes3d(ax)
     ax.set_title(f"Actual attention Top-30 per ray; layer {layer}; mean of 8 heads")
+    fig.colorbar(plt.cm.ScalarMappable(norm=colors.Normalize(0, 1), cmap="inferno"),
+                 ax=ax, shrink=.5, pad=.02, label="Attention / per-ray maximum")
     fig.suptitle(f"V4 · {scene['name']} · active set {len(indices)} / public {len(memory)}; heat normalized per ray")
     save(fig, folder/"V4_attention_rays.png")
 
@@ -271,14 +297,20 @@ def deliver_visualizations(model, samples, output_dir, records):
         memory = model.build_memory(scene["mapping"])
         full = model(query, memory, return_attention=True)
         empty = model(query, memory.subset(slice(0, 0)))
-        hp, wp = query.rgb.shape[-2]//14, query.rgb.shape[-1]//14
-        render1 = model.render_reader.render(memory, full["T1"], patch_intrinsics(query.K), hp, wp)
+        from src.geometry import intrinsics_cv_to_edge
+        h, w = query.rgb.shape[-2:]
+        render0 = model.render_reader.render(memory, full["T0"], intrinsics_cv_to_edge(query.K), h, w)
+        render1 = model.render_reader.render(memory, full["T1"], intrinsics_cv_to_edge(query.K), h, w)
         # Select a bbox near the central query surface only in the evaluator;
         # neither query GT nor this evaluator is part of model.forward().
-        center_point = target.world_points[query.rgb.shape[-2]//2, query.rgb.shape[-1]//2]
+        valid_pixels = target.valid.nonzero()
+        desired = valid_pixels.new_tensor([h//2, 3*w//4])
+        chosen_pixel = valid_pixels[(valid_pixels-desired).float().square().sum(-1).argmin()]
+        center_point = target.world_points[chosen_pixel[0], chosen_pixel[1]]
         center_index = (memory.means-center_point).norm(dim=-1).argmin()
-        center = memory.means[center_index].detach()
-        radius = center.new_tensor([.4, .5, .4])
+        nearest = memory.means[center_index].detach()
+        center = .5*(nearest+center_point)
+        radius = torch.maximum(center.new_tensor([.4, .5, .4]), (nearest-center_point).abs()*.5+.1)
         box = (center-radius, center+radius)
         erased_memory, mask = memory.erase_box(*box)
         erased = model(query, erased_memory)
@@ -286,27 +318,50 @@ def deliver_visualizations(model, samples, output_dir, records):
         _, empty_metrics = world_loss(empty, target)
         _, erased_metrics = world_loss(erased, target)
         metrics = {"full": full_metrics, "empty_same_weights": empty_metrics, "erased_same_weights": erased_metrics}
+        attention = full["attention"]["attention"]
+        entropy = None
+        if attention is not None and attention.shape[-1] > 1:
+            distribution = attention.float().mean(0).clamp_min(1e-10)
+            entropy = float((-(distribution*distribution.log()).sum(-1)/np.log(distribution.shape[-1])).mean())
+        scales = torch.linalg.eigvalsh(memory.covars).clamp_min(0).sqrt()
+        metrics["memory"] = {"public_gaussians": len(memory), "active_gaussians": len(full["attention"]["indices"]),
+                             "alpha_range": [float(memory.alpha.min()), float(memory.alpha.max())],
+                             "axis_scale_range_m": [float(scales.min()), float(scales.max())],
+                             "attention_normalized_entropy_mean": entropy,
+                             "o5_gate": float(model.render_reader.gate), "o6_gate": float(model.pe_reader.gate)}
+        metrics["all_training_queries"] = []
+        for query_index, (training_query, training_target) in enumerate(scene["queries"]):
+            training_prediction = full if query_index == 1 else model(training_query, memory)
+            _, query_metrics = world_loss(training_prediction, training_target)
+            metrics["all_training_queries"].append(dict(query_index=query_index, **query_metrics))
         metrics["wall"] = v1(scene_folder, scene, query, target, full)
         v2(scene_folder, scene, memory)
-        v3(scene_folder, scene, query, target, full, empty, render1)
+        v3(scene_folder, scene, query, target, full, empty, render0, render1)
         v4(scene_folder, scene, query, memory, full, model.receive_layer)
         metrics["erasure"] = v5(scene_folder, scene, query, target, memory, full, erased, box, mask)
+        if not metrics["erasure"]["local_pixels"]:
+            raise RuntimeError("Erasure bbox has no visible evaluation surface")
         # Same-scene held-out query is diagnostic, not disjoint-scene validation.
         heldout_query, heldout_target = scene["heldout"][0]
         _, metrics["heldout_query_diagnostic"] = world_loss(model(heldout_query, memory), heldout_target)
         all_metrics[scene["name"]] = metrics
         print("Visualizations generated:", scene_folder, flush=True)
+    plot_training_curves(output_dir, records)
+    (output_dir/"evaluation.json").write_text(json.dumps(all_metrics, indent=2)+"\n")
+    print("V1–V5 images exist; open and inspect them before reporting completion.", flush=True)
+
+
+def plot_training_curves(output_dir, records):
     fig, axes = plt.subplots(1, 3, figsize=(13, 3.5), layout="constrained")
-    for name in dict.fromkeys(record["scene"] for record in records):
+    palette = ["#0072b2", "#d55e00", "#009e73"]
+    for index, name in enumerate(dict.fromkeys(record["scene"] for record in records)):
         data = [r for r in records if r["scene"] == name]
         for ax, key, title in zip(axes, ["loss", "point_epe_m", "translation1_m"], ["World + pose loss", "World EPE [m]", "Refined translation [m]"]):
             values = np.array([r[key] for r in data])
             steps = np.array([r["step"] for r in data])
-            ax.plot(steps, values, alpha=.18)
+            ax.plot(steps, values, alpha=.18, color=palette[index])
             if len(values) >= 10:
-                ax.plot(steps[9:], np.convolve(values, np.ones(10)/10, mode="valid"), label=name)
+                ax.plot(steps[9:], np.convolve(values, np.ones(10)/10, mode="valid"), label=name, color=palette[index])
             ax.set(xlabel="Total updates", title=title)
     axes[0].legend(fontsize=7)
-    save(fig, folder/"training_curves.png")
-    (output_dir/"evaluation.json").write_text(json.dumps(all_metrics, indent=2)+"\n")
-    print("V1–V5 images exist; open and inspect them before reporting completion.", flush=True)
+    save(fig, output_dir/"vis/training_curves.png")

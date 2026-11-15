@@ -27,12 +27,17 @@ assets:
   vggt_weights:
     path: /mnt/f70f6709-366e-49a0-861f-497645d98975/users/liwt/data/GRoPE/gaussian_memory/model.safetensors
     status: header_verified_1797_keys_344_patch_embed_keys
-    load_verified: false
+    load_verified: true
+    strict_loaded_modules: [aggregator, point_head]
   dinov2_weights:
     path: /mnt/f70f6709-366e-49a0-861f-497645d98975/users/liwt/data/GRoPE/gaussian_memory/model.safetensors
     status: embedded_in_complete_vggt_checkpoint
     key_prefix: aggregator.patch_embed.
     standalone_weights_path: null
+    load_verified: true
+  streamvggt_weights:
+    path: /mnt/f70f6709-366e-49a0-861f-497645d98975/users/liwt/data/GRoPE/gaussian_memory/streamvggt/checkpoints.pth
+    status: file_found_user_provided_not_loaded_or_used
     load_verified: false
   official_vggt_source:
     path: /home/liwt/GRoPE/third_party/vggt
