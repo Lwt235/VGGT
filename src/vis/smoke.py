@@ -295,6 +295,8 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
             "full_epe_outside_m": float(error_before[outside].mean()) if outside.any() else None,
             "erased_epe_outside_m": float(error_after[outside].mean()) if outside.any() else None,
             "epe_increase_outside_m": float(error_delta[outside].mean()) if outside.any() else None,
+            "mean_abs_epe_change_inside_m": float(np.abs(error_delta[local]).mean()) if local.any() else None,
+            "mean_abs_epe_change_outside_m": float(np.abs(error_delta[outside]).mean()) if outside.any() else None,
             "pose_rotation_change_deg": float(rotation_change), "pose_translation_change_m": float(translation_change),
             "box_lower": lower.tolist(), "box_upper": upper.tolist()}
 
@@ -406,7 +408,7 @@ def gate_statistics(gate):
 
 def plot_training_curves(output_dir, records):
     fig, grid = plt.subplots(2, 3, figsize=(14, 7), layout="constrained")
-    fig.suptitle('Training poses include configured T0 perturbations / key dropout; final evaluation uses neither', fontsize=10)
+    fig.suptitle('Training curves follow the run augmentation config; fixed evaluation has no pose jitter or key dropout', fontsize=10)
     axes = grid.flatten()
     palette = ["#0072b2", "#d55e00", "#009e73"]
     for index, name in enumerate(dict.fromkeys(record["scene"] for record in records)):

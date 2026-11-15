@@ -12,8 +12,19 @@ from src.geometry import invert_se3, transform_points, world_rays
 from src.models.pose import PoseHead, rotation_6d, pose_from_vector
 
 
+def anchor_vote_weights(weights, memory, anchors, confidence):
+    # Total posterior spread relative to intrinsic token footprint: widely
+    # separated candidate surfaces must not drag the entire camera frame.
+    difference = memory.means[None]-anchors[:, None]
+    between = (weights*difference.square().sum(-1)).sum(-1)
+    within = weights @ memory.covars.diagonal(dim1=-2, dim2=-1).sum(-1)
+    ambiguity = between/(within+.01)
+    votes = (.05+confidence)/(1+ambiguity).sqrt()
+    return votes.clamp_min(.005)
+
+
 class SpatialBootstrap(nn.Module):
-    def __init__(self, token_dim=1024, latent_dim=256, *, local_rotation=True):
+    def __init__(self, token_dim=1024, latent_dim=256, *, local_rotation=True, robust_voting=False):
         super().__init__()
         self.query_residual = nn.Linear(token_dim+3, latent_dim)
         self.key_residual = nn.Linear(latent_dim+4, latent_dim)
@@ -22,6 +33,7 @@ class SpatialBootstrap(nn.Module):
             nn.init.zeros_(layer.bias)
         self.log_temperature = nn.Parameter(torch.tensor(math.log(20.)))
         self.key_dropout_mode = 'independent'
+        self.robust_voting = robust_voting
         self.patch_features = nn.Sequential(nn.LayerNorm(token_dim+5), nn.Linear(token_dim+5, 64), nn.GELU())
         self.coefficients = nn.Linear(64, 3)
         nn.init.zeros_(self.coefficients.weight)
@@ -67,14 +79,16 @@ class SpatialBootstrap(nn.Module):
         weights = logits.softmax(-1)
         anchors = weights @ memory.means
         confidence = 1.+(weights*weights.clamp_min(1e-9).log()).sum(-1)/math.log(max(2, len(memory)))
-        center = anchors.mean(0)
+        votes = anchor_vote_weights(weights, memory, anchors, confidence) if self.robust_voting else torch.ones_like(confidence)
+        votes = votes/votes.sum().clamp_min(1e-7)
+        center = (votes[:, None]*anchors).sum(0)
         radius = (anchors-center).norm(dim=-1, keepdim=True)
         features = self.patch_features(torch.cat((tokens, rays, confidence[:, None], radius), -1))
         coefficients = self.coefficients(features)
         # Preserve ray layout; uniform image pooling cannot recover these signed
         # world vectors. Learned corrections can handle oblique/reverse views.
-        a = ((rays[:, 0]+coefficients[:, 0])[:, None]*(anchors-center)).sum(0)
-        b = ((rays[:, 1]+coefficients[:, 1])[:, None]*(anchors-center)).sum(0)
+        a = (votes[:, None]*(rays[:, 0]+coefficients[:, 0])[:, None]*(anchors-center)).sum(0)
+        b = (votes[:, None]*(rays[:, 1]+coefficients[:, 1])[:, None]*(anchors-center)).sum(0)
         anchor_R = rotation_6d(torch.cat((a, b)))
         spatial = features.T.reshape(1, 64, height, width)
         pooled = F.adaptive_avg_pool2d(spatial, (4, 5))
@@ -84,10 +98,10 @@ class SpatialBootstrap(nn.Module):
             pooled = pooled+self.geometry_context(local_layout).reshape_as(pooled)
         local_translation = self.translation(pooled)[0]
         R = anchor_R if self.local_rotation is None else anchor_R @ rotation_6d(self.local_rotation(pooled)[0])
-        centroid_weights = coefficients[:, 2].softmax(0)
+        centroid_weights = (coefficients[:, 2]+votes.clamp_min(1e-8).log()).softmax(0)
         translation = centroid_weights @ anchors + anchor_R @ local_translation
         T = torch.cat((torch.cat((R, translation[:, None]), -1), eye[3:]), 0)
-        return T, dict(anchors=anchors, confidence=confidence, bootstrap_attention=weights, bootstrap_support=support)
+        return T, dict(anchors=anchors, confidence=confidence, bootstrap_attention=weights, bootstrap_support=support, anchor_votes=votes)
 
 
 class SpatialRefinement(nn.Module):

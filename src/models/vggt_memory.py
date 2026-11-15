@@ -89,7 +89,7 @@ class VGGTSpatialMemory(nn.Module):
         self.native.point_head.requires_grad_(True)
         self.native.aggregator.global_blocks[receive_layer].requires_grad_(True)
         self.receive_layer = receive_layer
-        if revision not in ('v2', 'v2b', 'v2c'):
+        if revision not in ('v2', 'v2b', 'v2c', 'v2g'):
             raise ValueError('Unknown model revision')
         self.revision = revision
         self.pose_jitter_probability = pose_jitter_probability
@@ -97,8 +97,8 @@ class VGGTSpatialMemory(nn.Module):
         self.fusion = SpatialMomentFusion()
         self.render_reader = RenderReader(metric_depth=revision!='v2')
         self.pe_reader = ParameterPEReader(opacity_occlusion=revision!='v2')
-        self.initial_pose = SpatialBootstrap(local_rotation=revision!='v2')
-        self.refine_pose = SpatialRefinement(direct_residual=revision=='v2c')
+        self.initial_pose = SpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision=='v2g')
+        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g'))
 
     def train(self, mode=True):
         super().train(mode)

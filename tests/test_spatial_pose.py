@@ -5,7 +5,7 @@ from src.data import QueryInput, Supervision
 from src.geometry import transform_points
 from src.losses.world import rotation_geodesic
 from src.memory.gaussians import GaussianMemory
-from src.models.spatial_pose import SpatialBootstrap, SpatialRefinement
+from src.models.spatial_pose import SpatialBootstrap, SpatialRefinement, anchor_vote_weights
 from src.readout.render import RenderReader, RenderedMemory
 
 
@@ -39,7 +39,7 @@ def test_random_world_gauge_changes_only_supervision_and_transports_bootstrap():
                             torch.full((30,), .5), torch.randn(30, 8))
     transported = GaussianMemory(transform_points(memory.means, G), G[:3, :3]@memory.covars@G[:3, :3].T,
                                  memory.alpha, memory.features)
-    model = SpatialBootstrap(dim, 8).eval()
+    model = SpatialBootstrap(dim, 8, robust_voting=True).eval()
     # Exercise learned geometric/context corrections, not only their initial
     # zero/identity values, under an arbitrary world gauge.
     with torch.no_grad():
@@ -95,3 +95,16 @@ def test_local_metric_readout_changes_covered_camera_rays_and_is_differentiable(
     rendered.opacity.zero_()
     uncovered, _ = reader.anchor_camera_geometry(points, rendered, K)
     torch.testing.assert_close(uncovered, points, atol=0, rtol=0)
+
+
+def test_ambiguous_spatial_matches_have_less_influence_on_world_pose():
+    means = torch.tensor([[-1., 0., 2.], [1., 0., 2.]], requires_grad=True)
+    covars = (torch.eye(3).repeat(2, 1, 1)*.01).requires_grad_()
+    memory = GaussianMemory(means, covars, torch.ones(2)*.5, torch.zeros(2, 8))
+    weights = torch.tensor([[.99, .01], [.5, .5]], requires_grad=True)
+    anchors = weights @ means
+    votes = anchor_vote_weights(weights, memory, anchors, torch.ones(2)*.5)
+    assert votes[0] > 2*votes[1]
+    votes.sum().backward()
+    assert torch.isfinite(means.grad).all() and means.grad.abs().sum() > 0
+    assert torch.isfinite(covars.grad).all() and covars.grad.abs().sum() > 0
