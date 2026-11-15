@@ -5,7 +5,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from src.geometry import covariance_from_quat_scale, transform_points, unproject
+from src.geometry import covariance_from_quat_scale, transform_points, unproject, invert_se3
 
 
 @dataclass
@@ -96,7 +96,7 @@ class SpatialMomentFusion(nn.Module):
         self.feature_gate = nn.Parameter(torch.tensor(0.))
         self.opacity_gate = nn.Parameter(torch.tensor(0.))
 
-    def forward(self, memory: GaussianMemory) -> GaussianMemory:
+    def forward(self, memory: GaussianMemory, reference_c2w=None) -> GaussianMemory:
         if len(memory) == 0:
             return memory
         with torch.no_grad():
@@ -105,7 +105,13 @@ class SpatialMomentFusion(nn.Module):
             size = (2*eigenvalues[:, 1].clamp_min(1e-10).sqrt()).clamp_min(self.min_cell)
             band = torch.floor(torch.log2(size/self.min_cell))
             cell_size = self.min_cell * torch.pow(2., band)
-            cells = torch.floor(memory.means.detach()/cell_size[:, None]).long()
+            # Anchor only the discrete hash grid to the first mapping camera.
+            # A random world gauge must transport the map, not change which
+            # observations fuse. The stored/output moments remain WORLD values.
+            hash_means = memory.means.detach()
+            if reference_c2w is not None:
+                hash_means = transform_points(hash_means, invert_se3(reference_c2w.detach()))
+            cells = torch.floor(hash_means/cell_size[:, None]).long()
             keys = torch.cat((band.long()[:, None], cells), -1).cpu().tolist()
             normals = eigenvectors[..., 0].cpu().numpy()
             buckets = {}

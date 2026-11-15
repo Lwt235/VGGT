@@ -124,7 +124,14 @@ def main():
     if residual_params:
         groups.append({'params': residual_params, 'lr': optim_config['refinement_geometry_lr']})
     optimizer = torch.optim.AdamW(groups, weight_decay=.01)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min((step+1)/optim_config["warmup_steps"], 1.))
+    def lr_multiplier(step):
+        warmup = optim_config['warmup_steps']
+        if step < warmup:
+            return (step+1)/warmup
+        end_ratio = optim_config.get('end_lr_ratio', 1.)
+        progress = min(1., (step-warmup)/max(1, steps-warmup))
+        return end_ratio+(1-end_ratio)*.5*(1+math.cos(math.pi*progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
     modules = {"writer": model.writer, "o5": model.render_reader, "o6": model.pe_reader,
                "dpt": model.native.point_head, "pose0": model.initial_pose,
                "pose1": model.refine_pose, "reception": model.native.aggregator.global_blocks[config["receive_layer"]]}
