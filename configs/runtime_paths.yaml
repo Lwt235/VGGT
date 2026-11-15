@@ -8,31 +8,37 @@ old_repository:
   history_imported: false
   processes_terminated: []
 python:
-  executable: /home/liwt/anaconda3/bin/python
+  executable: /home/liwt/miniColmap/.venv/bin/python
+  alternative_executable: /home/liwt/anaconda3/bin/python
   path_found: true
   import_verified: [torch, numpy, pytest, yaml, PIL, matplotlib]
   python_version: '3.11'
   torch_version: 2.6.0+cu124
   torch_cuda_build: '12.4'
   system_glibc: '2.27'
-  gpu_matmul_verified: false  # updated only after actual host GPU probe
-  gsplat_import_verified: false
-  gsplat_gpu_render_verified: false
-  missing_imports: [gsplat, safetensors, huggingface_hub, einops]
+  gpu_matmul_verified: true
+  gsplat_import_verified: true
+  gsplat_gpu_render_verified: true
+  gsplat_version: 1.5.3
+  gsplat_existing_package: /home/liwt/miniColmap/.venv/lib/python3.11/site-packages/gsplat
+  supplemental_dependencies: /home/liwt/VGGT/.deps
+  missing_imports: []
 assets:
   vggt_weights:
-    path: null
-    status: not_found_in_bounded_inventory
+    path: /mnt/f70f6709-366e-49a0-861f-497645d98975/users/liwt/data/GRoPE/gaussian_memory/model.safetensors
+    status: header_verified_1797_keys_344_patch_embed_keys
     load_verified: false
   dinov2_weights:
-    path: null
-    status: not_found_in_bounded_inventory
+    path: /mnt/f70f6709-366e-49a0-861f-497645d98975/users/liwt/data/GRoPE/gaussian_memory/model.safetensors
+    status: embedded_in_complete_vggt_checkpoint
+    key_prefix: aggregator.patch_embed.
+    standalone_weights_path: null
     load_verified: false
   official_vggt_source:
     path: /home/liwt/GRoPE/third_party/vggt
     pinned_commit_file_value: a288dd0f14786c93483e45524328726ab7b1b4ce
     status: found_source_only
-    import_verified: false
+    import_verified: true
     write_allowed: false
     note: Official third-party source only; not old project business code. No runtime download.
 datasets:
@@ -47,14 +53,14 @@ datasets:
     depth_encoding: uint16_rotate_right_3_bits
     depth_definition: camera_z_not_euclidean_ray_length
     native_pose_convention: camera_to_world
-    pose_convention_status: pending_official_loader_and_multiview_check
-    pixel_convention: OpenCV_integer_centers
+    pose_convention_status: official_c2w_export_and_real_multiview_depth_checked
+    pixel_convention: MATLAB_1_based_converted_to_OpenCV_by_principal_point_minus_1
     train_scenes:
       - /home/liwt/GRoPE/data/round5_sun3d/harvard_c5/hv_c5_1
       - /home/liwt/GRoPE/data/round6_sun3d/brown_bm_1/brown_bm_1
       - /home/liwt/GRoPE/data/round5_sun3d/harvard_c6/hv_c6_1
-    val_scene: null  # select a disjoint verified scene before main training
-    sample_load_verified: false
+    val_scene: /home/liwt/GRoPE/data/round5_sun3d/harvard_c11/hv_c11_2
+    sample_load_verified: true
   scannet:
     path: null
     status: not_found_in_bounded_inventory

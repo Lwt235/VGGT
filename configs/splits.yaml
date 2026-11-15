@@ -1,0 +1,13 @@
+# Scene-level split for future main training; no overlap across splits.
+# Step 1 overfits the three train scenes, with separate mapping/query frame IDs.
+train:
+  - /home/liwt/GRoPE/data/round5_sun3d/harvard_c5/hv_c5_1
+  - /home/liwt/GRoPE/data/round6_sun3d/brown_bm_1/brown_bm_1
+  - /home/liwt/GRoPE/data/round5_sun3d/harvard_c6/hv_c6_1
+val:
+  - /home/liwt/GRoPE/data/round5_sun3d/harvard_c11/hv_c11_2
+smoke:
+  mapping_indices: [0, 2, 4]
+  training_query_indices: [1, 3, 5]
+  heldout_query_indices: [6]
+  heldout_scope: same_scene_diagnostic_only_not_cross_scene_validation

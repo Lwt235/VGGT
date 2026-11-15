@@ -6,7 +6,7 @@
 
 阶段顺序：1. 只读盘点/独立初始化 → 2. Builder-First AGENTS → 3. 本方案 → 4. Step 1 几何与三场景冒烟。阶段 3 的方案写入本文件，不等待额外行政确认即执行 Step 1。阶段状态以实际测试/训练结果为准，不把找到路径、成功导入、GPU 运算成功、GPU 渲染成功混为一谈。
 
-已知前置缺项：有 Python/PyTorch 和 Sun3D，有限盘点未找到官方 VGGT/DINOv2 大权重，解释器未安装 gsplat、einops、huggingface_hub、safetensors。官方源码存在不等于权重存在。不下载大资产或升级系统；可继续几何与可微模块开发，真实三场景过拟合须等待必要资产就绪。初始提交后继续实现，不用随机骨干/合成数据训练冒充要求的真实 VGGT 冒烟。
+初始提交 `5ae42a4` 已完成。初始有限盘点未找到权重；用户随后提供了只读共享盘上的完整官方 VGGT `model.safetensors` 和兼容的 miniColmap 环境，已核实文件头 1797 个张量、344 个 DINOv2 patch_embed 张量。独立 DINOv2 文件未确认，使用完整模型内嵌的官方编码器参数。小型补充依赖仅写项目 `.deps`，不修改既有 Conda、venv 或系统。真实 gsplat GPU 几何测试已通过，当前执行实际模型接入/梯度检查和三场景冒烟；最终状态写入 Step 1 报告。
 
 ## 痛点与整体通路
 
@@ -60,7 +60,9 @@ K/V 来自 z 与中心 PE，Cross-Attention 注入 VGGT 交互层，残差门控
 
 1. 首先 `/home/liwt/anaconda3/bin/python -B -m pytest tests/test_geometry_conventions.py`。覆盖 WXYZ、非平凡 c2w/w2c、轴向/像素中心/z 深度、14 倍 patch K 变换、世界反投影/重投影、受控 gsplat 深度/坐标/混合/透明度。缺 CUDA/gsplat 的测试明确 skip，不算渲染通过；必要时启用严格渲染开关使缺项直接失败。
 2. 选三个真实 Sun3D 室内场景：教室 harvard_c5、办公室 brown_bm_1、另一教室 harvard_c6，须检查目录、数据格式、覆盖与外参。固定 seed=17；明确建图/查询帧，并固定场景不交叉的 train/val 主线划分。开发集可视化正常使用，不引入 fresh/used。
-3. 800–1500 更新步（默认 1000），轮换三场景，冻结 DINOv2，训练其余指定模块。冒烟属于三场景训练集过拟合；同场景固定 held-out query 仅作诊断，不谎称跨场景 val。每场景应有足够更新次数。
+3. 800–1500 更新步（默认 1000），轮换三场景，冻结 DINOv2，训练其余指定模块。当前冒烟为 112×140 图像、8×10 patch 网格；历史 Writer 直接使用官方冻结 DINOv2 patch tokens，查询使用完整官方 24 组交替交互层与原生 DPT，在第 4 号 global block 后注入 O5/O6。训练这个接收 global block、DPT、Writer/融合、双 Reader 与两阶段 Pose；其余预训练交互块冻结参数但保留回传到接收层的计算图。图像低分辨率只用于过拟合冒烟，不能当作主线最终质量。冒烟属于三场景训练集过拟合；同场景固定 held-out query 仅作诊断，不谎称跨场景 val。每场景应有足够更新次数。
+
+   查询原生单帧 DPT 输出在模型内部视为相机系点，并以预测 T1 转为世界点后计算直接世界 loss；此处没有真值位姿或事后拟合。`configs/splits.yaml` 固定场景划分和建图/查询索引；未来主线 val 为 harvard_c11，和三个 train 场景分离。
 4. 记录实际 Loss/EPE/pose T0/T1，alpha/scale/特征的范围，mu/Sigma/alpha/z 的 autograd，门控开启后各分支 grad norm、参数更新及 finite 检查。持续断梯度/NaN 必须修复。明显下降的判据预设为前后窗口可见下降并检查曲线，不以一次波动判停。
 5. 实际生成并打开 V1–V5 后写观察。缺大权重/依赖时不以合成/缩小的替身实验宣布 Step 1 通过；保存实际可完成的几何/模块检查，并列出最小解阻项。没有 V6 不阻塞此阶段。
 
@@ -88,4 +90,4 @@ K/V 来自 z 与中心 PE，Cross-Attention 注入 VGGT 交互层，残差门控
 - [VGGT 官方几何实现](https://github.com/facebookresearch/vggt/blob/main/vggt/utils/geometry.py)：OpenCV w2c、整数网格、camera-z 深度。
 - [gsplat 数据约定](https://docs.gsplat.studio/main/conventions/data_conventions.html)：WXYZ 和 w2c。
 - [gsplat 光栅接口](https://docs.gsplat.studio/versions/1.5.3/apis/rasterization.html)：任意属性通道、累积 alpha、深度类型和相机梯度限制；内参不作为可学习参数。
-- [SUN3D 官方工具箱](https://github.com/PrincetonVision/SUN3Dtoolbox)：在真实读取前核实 uint16 depth 位旋转、米制换算和 pose 方向。
+- [SUN3D 官方工具箱](https://github.com/PrincetonVision/SUN3Dsfm)：`depthRead.m` 规定 uint16 右旋 3 位后除 1000；`outputCameraExtrinsics.m` 导出 c2w；`depth2XYZcamera.m` 使用 1 起始 MATLAB 坐标，本项目加载时主点减 1 再统一到 OpenCV。真实三场景数据已做跨视图 z 残差检查。
