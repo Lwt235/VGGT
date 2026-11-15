@@ -35,3 +35,9 @@ def test_native_block_adapter_matches_official_one_frame_aggregation():
     adapted, _ = aggregate_single(aggregator, image, shallow, lambda x: x+gate*x.sin(), receive_layer=0)
     adapted[-1].square().mean().backward()
     assert gate.grad is not None and torch.isfinite(gate.grad) and gate.grad.abs() > 0
+    # The *trainable receiving global block* sees injected patches and mixes
+    # their information into camera_token in this same layer.
+    aggregator.eval()
+    plain, _ = aggregate_single(aggregator, image, shallow)
+    injected, _ = aggregate_single(aggregator, image, shallow, lambda x: x+2*x.sin(), receive_layer=1)
+    assert (injected[1][0, 0, 0, 32:]-plain[1][0, 0, 0, 32:]).abs().max() > 1e-8

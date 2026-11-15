@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import yaml
 from src.data import QueryInput, Sun3DScene, Supervision
+from src.augmentation import augment_training_world
 from src.losses.world import world_loss
 from src.models.vggt_memory import VGGTSpatialMemory
 
@@ -56,8 +57,9 @@ def main():
     parser.add_argument("--run", default="smoke_seed17")
     parser.add_argument("--steps", type=int)
     parser.add_argument("--diagnostic", action="store_true", help="Short integration check, never a completed smoke")
+    parser.add_argument("--config", default="configs/smoke_v2.yaml")
     args = parser.parse_args()
-    with (PROJECT_ROOT/"configs/smoke.yaml").open() as handle:
+    with (PROJECT_ROOT/args.config).open() as handle:
         config = yaml.safe_load(handle)
     steps = args.steps if args.steps is not None else config["steps"]
     if not args.diagnostic and not 800 <= steps <= 1500:
@@ -73,7 +75,7 @@ def main():
         raise SystemExit("Launch through scripts/run_on_available_gpu.py for a live resource check")
     # GPU was selected by the parent launcher. Strict real geometry precedes all training.
     env = dict(os.environ, REQUIRE_GSPLAT="1")
-    subprocess.run([sys.executable, "-B", "-m", "pytest", "tests/test_geometry_conventions.py", "-q"],
+    subprocess.run([sys.executable, "-B", "-m", "pytest", "tests", "-q"],
                    cwd=PROJECT_ROOT, env=env, check=True)
     torch.set_num_threads(2)
     torch.manual_seed(config["seed"])
@@ -92,11 +94,14 @@ def main():
     samples = load_scene_samples(config, "cuda")
     pose_params = list(model.initial_pose.parameters())+list(model.refine_pose.parameters())
     native_params = [p for p in model.native.parameters() if p.requires_grad]
+    gate_params = [model.render_reader.gate, model.pe_reader.gate]
     other_params = [p for name, p in model.named_parameters() if p.requires_grad and
-                    not name.startswith(("native.", "initial_pose.", "refine_pose."))]
+                    not name.startswith(("native.", "initial_pose.", "refine_pose.")) and
+                    id(p) not in {id(g) for g in gate_params}]
     optim_config = config["optimizer"]
     groups = [{"params": other_params, "lr": optim_config["heads_lr"]},
               {"params": pose_params, "lr": optim_config["pose_lr"]},
+              {"params": gate_params, "lr": optim_config["gate_lr"], "weight_decay": 0.},
               {"params": native_params, "lr": optim_config["native_lr"]}]
     optimizer = torch.optim.AdamW(groups, weight_decay=.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min((step+1)/optim_config["warmup_steps"], 1.))
@@ -114,7 +119,8 @@ def main():
             query_idx = (step//3) % len(scene["queries"])
             query, target = scene["queries"][query_idx]
             optimizer.zero_grad(set_to_none=True)
-            memory = model.build_memory(scene["mapping"])
+            mapping, target, gauge = augment_training_world(scene["mapping"], target)
+            memory = model.build_memory(mapping)
             memory.retain_grad()
             prediction = model(query, memory)
             loss, metrics = world_loss(prediction, target)
@@ -134,7 +140,10 @@ def main():
             scheduler.step()
             metrics.update(step=step+1, scene=scene["name"], query_index=query_idx,
                            public_gaussians=len(memory), active_gaussians=len(prediction["attention"]["indices"]),
-                           o5_gate=float(model.render_reader.gate.detach()), o6_gate=float(model.pe_reader.gate.detach()),
+                           o5_gate=float(model.render_reader.gate.detach().tanh().abs().mean()), o6_gate=float(model.pe_reader.gate.detach().tanh().abs().mean()),
+                           o5_gate_max_abs=float(model.render_reader.gate.detach().tanh().abs().max()),
+                           o6_gate_max_abs=float(model.pe_reader.gate.detach().tanh().abs().max()),
+                           world_gauge=gauge.detach().cpu().tolist(),
                            module_grad_norms=norms, memory_grad_norms=state_norms, sampled_parameter_update_norms=updates,
                            min_covariance_eigenvalue=float(torch.linalg.eigvalsh(memory.covars.detach()).min()),
                            alpha_min=float(memory.alpha.detach().min()), alpha_max=float(memory.alpha.detach().max()))

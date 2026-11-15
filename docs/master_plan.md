@@ -52,7 +52,7 @@ K/V 来自 z 与中心 PE，Cross-Attention 注入 VGGT 交互层，残差门控
 
 ## 无查询真值位姿的两阶段自举
 
-初始 Pose 头只接收当前浅层特征和粗记忆摘要（例如全局 mu/feature 加权统计），预测世界系 T0。T0 构造查询射线并启动 O5/O6；DPT 与精化相机头输出 P_world 和 T1。Pose 输出的旋转需使用连续稳定参数化。GT 查询 T 仅作为训练 loss/评测目标；训练、验证接口均禁止传入读取函数。单场景 ID、目标点图或查询深度也不得充当旁路输入。
+Step 1.5 的初始 Pose 头使用浅层 patch、归一化相机射线与公共高斯的跨注意力对应，为每个 patch 聚合世界锚点与置信度。保留网格布局，以学习的带符号锚点差向量构造连续 6D 旋转，以空间特征预测相机局部平移；不做刚体拟合。T0 构造查询射线并启动 O5/O6；DPT 与精化相机头输出 P_world 和 T1。Pose 输出的旋转需使用连续稳定参数化。GT 查询 T 仅作为训练 loss/评测目标；训练、验证接口均禁止传入读取函数。单场景 ID、目标点图或查询深度也不得充当旁路输入。
 
 ## 损失与指标
 
@@ -62,7 +62,7 @@ K/V 来自 z 与中心 PE，Cross-Attention 注入 VGGT 交互层，残差门控
 
 1. 首先 `/home/liwt/anaconda3/bin/python -B -m pytest tests/test_geometry_conventions.py`。覆盖 WXYZ、非平凡 c2w/w2c、轴向/像素中心/z 深度、14 倍 patch K 变换、世界反投影/重投影、受控 gsplat 深度/坐标/混合/透明度。缺 CUDA/gsplat 的测试明确 skip，不算渲染通过；必要时启用严格渲染开关使缺项直接失败。
 2. 选三个真实 Sun3D 室内场景：教室 harvard_c5、办公室 brown_bm_1、另一教室 harvard_c6，须检查目录、数据格式、覆盖与外参。固定 seed=17；明确建图/查询帧，并固定场景不交叉的 train/val 主线划分。开发集可视化正常使用，不引入 fresh/used。
-3. 800–1500 更新步（默认 1000），轮换三场景，冻结 DINOv2，训练其余指定模块。当前冒烟为 112×140 图像、8×10 patch 网格；历史 Writer 直接使用官方冻结 DINOv2 patch tokens，查询使用完整官方 24 组交替交互层与原生 DPT，在第 4 号 global block 后注入 O5/O6。训练这个接收 global block、DPT、Writer/融合、双 Reader 与两阶段 Pose；其余预训练交互块冻结参数但保留回传到接收层的计算图。图像低分辨率只用于过拟合冒烟，不能当作主线最终质量。冒烟属于三场景训练集过拟合；同场景固定 held-out query 仅作诊断，不谎称跨场景 val。每场景应有足够更新次数。
+3. 800–1500 更新步（默认 1000），轮换三场景，冻结 DINOv2，训练其余指定模块。当前冒烟为 112×140 图像、8×10 patch 网格；历史 Writer 直接使用官方冻结 DINOv2 patch tokens，查询使用完整官方 24 组交替交互层与原生 DPT，在第 4 号可训练 global block 前注入 O5/O6。训练这个接收 global block、DPT、Writer/融合、双 Reader 与两阶段 Pose；其余预训练交互块冻结参数但保留回传到接收层的计算图。图像低分辨率只用于过拟合冒烟，不能当作主线最终质量。冒烟属于三场景训练集过拟合；同场景固定 held-out query 仅作诊断，不谎称跨场景 val。每场景应有足够更新次数。
 
    查询原生单帧 DPT 输出在模型内部视为相机系点，并以预测 T1 转为世界点后计算直接世界 loss；此处没有真值位姿或事后拟合。`configs/splits.yaml` 固定场景划分和建图/查询索引；未来主线 val 为 harvard_c11，和三个 train 场景分离。
 4. 记录实际 Loss/EPE/pose T0/T1，alpha/scale/特征的范围，mu/Sigma/alpha/z 的 autograd，门控开启后各分支 grad norm、参数更新及 finite 检查。持续断梯度/NaN 必须修复。明显下降的判据预设为前后窗口可见下降并检查曲线，不以一次波动判停。
@@ -93,3 +93,18 @@ K/V 来自 z 与中心 PE，Cross-Attention 注入 VGGT 交互层，残差门控
 - [gsplat 数据约定](https://docs.gsplat.studio/main/conventions/data_conventions.html)：WXYZ 和 w2c。
 - [gsplat 光栅接口](https://docs.gsplat.studio/versions/1.5.3/apis/rasterization.html)：任意属性通道、累积 alpha、深度类型和相机梯度限制；内参不作为可学习参数。
 - [SUN3D 官方工具箱](https://github.com/PrincetonVision/SUN3Dsfm)：`depthRead.m` 规定 uint16 右旋 3 位后除 1000；`outputCameraExtrinsics.m` 导出 c2w；`depth2XYZcamera.m` 使用 1 起始 MATLAB 坐标，本项目加载时主点减 1 再统一到 OpenCV。真实三场景数据已做跨视图 z 残差检查。
+
+
+## Step 1.5：定向修复与三场景复验（执行中）
+
+先做只读共视诊断，结果在 `results/covisibility_seed17/coverage.json`。原始 480×640 留出有效点：C5 217183，Brown 266888，C6 238805。落入 v1 公共记忆 3σ 椭球的比例分别为 48.85%、1.91%、73.20%；建图视锥内比例 74.34%、60.35%、100%；10 cm 深度一致共视比例 58.39%、0%、76.68%。视锥相交不等于表面可见：Brown 3330 属极低真实表面共视，不能把它描述为普通充分重叠重定位，也不是完全位于所有视锥之外。此检查不改变查询划分或模型输入。
+
+修复接收顺序后，O5/O6 在接收交互块之前注入，因而 patch 与 camera token 都能通过同一可训练交互块融合空间记忆。两个 Reader 均采用 LayerNorm 后的逐通道 tanh 零门控，零步保持恒等；门控独立使用较高学习率。O6 Query 补对称的 opacity 门控中心 PE 和世界射线，Key 高频相位保持无衰减；深度几何特征采用 log1p/有界缩放，正系数射线马氏距离与后方遮挡先验使零步注意力已有选择性。
+
+每个训练 step 随机均匀 SO(3) 加 ±3 m 平移，左乘所有建图 c2w 与目标 c2w，并同步变换监督世界点，在 build_memory 前执行；QueryInput 仍只有 RGB、K。评估和绘图始终 G=I、首建图相机参考系。自举头的世界向量来自匹配锚点差，平移由世界锚点加预测旋转下的局部位移构造，因此不能单凭固定 RGB 背出增强后的世界系。
+
+先运行原生 DPT 获得相机系点，再聚合到 patch 网格，以 T0.detach() 变换到世界，与 O5 坐标、opacity、深度方差和相机射线构造空间残差；卷积网格头预测连续 6D ΔT，T1=T0.detach()@ΔT。损失分别监督 T0/T1 的米制平移、atan2 测地旋转、粗/精世界点，以及逐 patch 世界锚点。没有查询真值输入或事后对齐。
+
+运行 `REQUIRE_GSPLAT=1` 全部 tests 后，使用 `configs/smoke_v2.yaml`、seed17、新目录 `results/smoke_seed17_v2/` 跑 1500 步完整模型。heads/pose LR=3e-4，门控=3e-3，native=3e-6；DINO 保持冻结。记录所有记忆字段/模块梯度、门控均值与最大绝对值、协方差最小特征值。最终固定同权重评估全部训练查询与同场景留出，统计 T0→T1 增益、注意力熵，以及 bbox 内外的 EPE 增量，而非仅输出位移。
+
+必须生成并打开三场景 V1–V5 与训练曲线。四项实质改善后提交报告并停下，待用户确认再启动 Step 2；未改善则依据实际数据继续诊断完整系统，不做组件消融。当前计划中的 Step 2 尚未获准启动。

@@ -15,7 +15,7 @@ from torch.nn import functional as F
 from src.data import QueryInput
 from src.geometry import patch_intrinsics, transform_points
 from src.memory.gaussians import GaussianMemory, SpatialMomentFusion, TokenGaussianWriter
-from src.models.pose import PoseHead
+from src.models.spatial_pose import SpatialBootstrap, SpatialRefinement
 from src.readout.parameter_pe import ParameterPEReader
 from src.readout.render import RenderReader
 from src.runtime import configure_local_storage, load_checkpoint_readonly
@@ -60,10 +60,10 @@ def aggregate_single(aggregator, rgb, patch_tokens, injection=None, receive_laye
     cached = getattr(aggregator, "cached_layer_indices", set(range(aggregator.depth)))
     for layer in range(aggregator.depth):
         tokens, _, frame = aggregator._process_frame_attention(tokens, 1, 1, count, dim, layer, pos=position)
-        tokens, _, _ = aggregator._process_global_attention(tokens, 1, 1, count, dim, layer, pos=position)
         if injection is not None and layer == receive_layer:
             patch = injection(tokens[0, start:].float()).to(tokens.dtype)
             tokens = torch.cat((tokens[:, :start], patch[None]), 1)
+        tokens, _, _ = aggregator._process_global_attention(tokens, 1, 1, count, dim, layer, pos=position)
         outputs.append(torch.cat((frame[0], tokens.reshape(1, 1, count, dim)), -1) if layer in cached else None)
     return outputs, start
 
@@ -93,8 +93,8 @@ class VGGTSpatialMemory(nn.Module):
         self.fusion = SpatialMomentFusion()
         self.render_reader = RenderReader()
         self.pe_reader = ParameterPEReader()
-        self.initial_pose = PoseHead(1024+259)
-        self.refine_pose = PoseHead(2048+259)
+        self.initial_pose = SpatialBootstrap()
+        self.refine_pose = SpatialRefinement()
 
     def train(self, mode=True):
         super().train(mode)
@@ -129,32 +129,28 @@ class VGGTSpatialMemory(nn.Module):
         height, width = rgb.shape[-2:]
         hp, wp = height//14, width//14
         shallow = frozen_patch_tokens(self.native.aggregator, rgb)
-        if len(memory):
-            weights = memory.alpha/memory.alpha.sum().clamp_min(1e-6)
-            summary = torch.cat(((weights[:, None]*memory.means).sum(0),
-                                 (weights[:, None]*memory.features).sum(0)))
-        else:
-            summary = rgb.new_zeros(259)
-        T0 = self.initial_pose(torch.cat((shallow[0].float().mean(0), summary)))
         Kp = patch_intrinsics(K)
-        diagnostic = {}
+        T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
         def receive(tokens):
             with torch.autocast(device_type=rgb.device.type, enabled=False):
                 read, rendered = self.render_reader(tokens.float(), memory, T0, Kp, hp, wp)
                 read, attention = self.pe_reader(read, memory, T0, Kp, hp, wp, rendered.depth,
-                                                 return_attention=return_attention)
+                                                 rendered=rendered, return_attention=return_attention)
             diagnostic.update(rendered=rendered, attention=attention)
             return read
         with torch.autocast(device_type=rgb.device.type, dtype=torch.bfloat16, enabled=rgb.is_cuda):
             outputs, start = aggregate_single(self.native.aggregator, rgb, shallow,
                                                receive, self.receive_layer)
-        final = outputs[-1][0, 0, start:].float().mean(0)
-        T1 = T0 @ self.refine_pose(torch.cat((final, summary)))
         # The native single-frame DPT output is interpreted in query-camera
         # coordinates, transformed with the PREDICTED pose inside the model.
         # Loss and evaluation use the resulting world points directly.
         with torch.autocast(device_type=rgb.device.type, enabled=False):
             dpt_outputs = [None if value is None else value.float() for value in outputs]
             camera_points, _ = self.native.point_head(dpt_outputs, images=rgb[None, None], patch_start_idx=start)
-            points = transform_points(camera_points[0, 0], T1)
-        return {"world_points": points, "T0": T0, "T1": T1, **diagnostic}
+            camera_points = camera_points[0, 0]
+            final = outputs[-1][0, 0, start:].float()
+            T1, X_T0, residual = self.refine_pose(final, camera_points, T0, diagnostic['rendered'], Kp, hp, wp)
+            points = transform_points(camera_points, T1)
+            coarse_points = transform_points(camera_points, T0)
+        return {"world_points": points, "coarse_world_points": coarse_points, "camera_points": camera_points,
+                "X_T0_patch": X_T0, "alignment_residual": residual, "T0": T0, "T1": T1, **diagnostic}

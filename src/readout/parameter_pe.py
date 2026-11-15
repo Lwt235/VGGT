@@ -3,6 +3,7 @@
 import math
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from src.geometry import ray_ellipsoid_distance, transform_points, world_rays
 from src.memory.gaussians import GaussianMemory
 
@@ -46,15 +47,19 @@ class ParameterPEReader(nn.Module):
             raise ValueError("token_dim must divide heads")
         self.heads, self.bands = heads, bands
         self.query = nn.Linear(token_dim, token_dim)
+        self.query_geometry = nn.Linear(6*bands+6, token_dim, bias=False)
         self.key = nn.Linear(latent_dim+6*bands, token_dim)
         self.value = nn.Linear(latent_dim, token_dim)
         self.bias = nn.Sequential(nn.Linear(8, 32), nn.GELU(), nn.Linear(32, heads))
         self.output = nn.Linear(token_dim, token_dim)
-        self.gate = nn.Parameter(torch.tensor(0.))
+        self.norm = nn.LayerNorm(token_dim)
+        self.gate = nn.Parameter(torch.zeros(token_dim))
+        self.gamma = nn.Parameter(torch.full((heads,), 1.))
+        self.beta = nn.Parameter(torch.full((heads,), 1.))
 
     def forward(self, tokens: Tensor, memory: GaussianMemory, query_c2w: Tensor,
                 K_patch: Tensor, height: int, width: int, render_depth: Tensor,
-                *, active_budget=2048, query_chunk=128, return_attention=False):
+                *, rendered=None, active_budget=2048, query_chunk=128, return_attention=False):
         selected, indices = active_memory(memory, query_c2w, K_patch, height, width, budget=active_budget)
         if len(selected) == 0:
             return tokens, {"indices": indices, "attention": None}
@@ -64,7 +69,11 @@ class ParameterPEReader(nn.Module):
         eigenvalues, eigenvectors = torch.linalg.eigh(selected.covars)
         log_scales = eigenvalues.clamp_min(1e-10).sqrt().log()
         normals = eigenvectors[..., 0]
-        q = self.query(tokens).reshape(nquery, self.heads, head_dim)
+        position = tokens.new_zeros(nquery, 6*self.bands)
+        if rendered is not None:
+            position = center_pe(rendered.world.reshape(-1, 3), self.bands)*rendered.opacity.reshape(-1, 1)
+        ray_geometry = torch.cat((position, directions, origins/5.), -1)
+        q = (self.query(tokens)+self.query_geometry(ray_geometry)).reshape(nquery, self.heads, head_dim)
         k = self.key(torch.cat((selected.features, center_pe(selected.means, self.bands)), -1))
         k = k.reshape(len(selected), self.heads, head_dim)
         v = self.value(selected.features).reshape(len(selected), self.heads, head_dim)
@@ -77,14 +86,16 @@ class ParameterPEReader(nn.Module):
             relative_z = closest_z-render_depth.reshape(-1)[start:stop, None]
             normal_cos = torch.abs(directions[start:stop] @ normals.T)
             shape = log_scales[None].expand(stop-start, -1, -1)
-            geometry = torch.cat((torch.log1p(rho2)[..., None], closest_z[..., None],
-                                  relative_z[..., None], normal_cos[..., None], shape,
+            geometry = torch.cat((torch.log1p(rho2)[..., None], torch.log1p(closest_z)[..., None],
+                                  torch.tanh(relative_z/2.)[..., None], normal_cos[..., None], shape,
                                   selected.alpha[None, :, None].expand(stop-start, -1, -1)), -1)
             bias = self.bias(geometry).permute(2, 0, 1)
-            logits = torch.einsum("qhd,mhd->hqm", q[start:stop], k)/math.sqrt(head_dim) + bias
+            prior = (-F.softplus(self.gamma)[:, None, None]*torch.log1p(rho2)[None]
+                     -F.softplus(self.beta)[:, None, None]*F.relu(relative_z)[None])
+            logits = torch.einsum("qhd,mhd->hqm", q[start:stop], k)/math.sqrt(head_dim) + bias + prior
             weights = logits.softmax(-1)
             chunks.append(torch.einsum("hqm,mhd->qhd", weights, v).reshape(stop-start, channels))
             if return_attention:
                 attention.append(weights.detach())
-        output = tokens + self.gate.tanh()*self.output(torch.cat(chunks))
+        output = tokens + self.gate.tanh()*self.norm(self.output(torch.cat(chunks)))
         return output, {"indices": indices, "attention": torch.cat(attention, 1) if attention else None}

@@ -72,7 +72,8 @@ def test_zero_gate_opens_then_writer_and_o6_receive_nonzero_gradients():
         loss.backward()
         if step == 0:
             torch.testing.assert_close(output, query_tokens)
-            assert reader.gate.grad.abs() > 0
+            assert reader.gate.shape == (16,)
+            assert reader.gate.grad.abs().sum() > 0
         else:
             for value in (memory.means, memory.covars, memory.alpha, memory.features):
                 assert value.grad is not None and torch.isfinite(value.grad).all()
@@ -81,8 +82,25 @@ def test_zero_gate_opens_then_writer_and_o6_receive_nonzero_gradients():
             assert writer.latent.weight.grad.abs().sum() > 0
             assert reader.bias[0].weight.grad.abs().sum() > 0
         optimizer.step()
-    assert reader.gate.detach().abs() > 0
+    assert reader.gate.detach().abs().sum() > 0
     assert info["attention"].shape == (2, 12, len(info["indices"]))
+
+
+def test_o6_physical_prior_selects_ray_neighbors_before_gate_opens():
+    reader = ParameterPEReader(16, latent_dim=8, heads=2, bands=4)
+    # Remove learned appearance/bias so selectivity must come from physics.
+    for layer in (reader.query, reader.key, *[x for x in reader.bias if isinstance(x, torch.nn.Linear)]):
+        torch.nn.init.zeros_(layer.weight)
+        torch.nn.init.zeros_(layer.bias)
+    memory = GaussianMemory(torch.tensor([[0., 0., 2.], [1., 0., 2.], [0., 0., 4.]]),
+                            torch.eye(3).repeat(3, 1, 1)*.01, torch.ones(3)*.5, torch.zeros(3, 8))
+    K = torch.tensor([[2., 0., .5], [0., 2., .5], [0., 0., 1.]])
+    tokens = torch.randn(1, 16)
+    output, info = reader(tokens, memory, torch.eye(4), K, 1, 1, torch.tensor([[[2.]]]), return_attention=True)
+    torch.testing.assert_close(output, tokens, atol=0, rtol=0)
+    weights = info['attention']
+    assert (weights[:, 0, 0] > 5*weights[:, 0, 1]).all()
+    assert (weights[:, 0, 0] > 5*weights[:, 0, 2]).all()
 
 
 def test_active_read_budget_and_box_erasure_do_not_mutate_public_memory():

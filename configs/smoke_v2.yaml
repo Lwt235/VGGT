@@ -1,0 +1,18 @@
+seed: 17
+steps: 1500
+image_hw: [112, 140]
+receive_layer: 4
+mapping_indices: [0, 2, 4]
+query_indices: [1, 3, 5]
+heldout_query_indices: [6]
+optimizer:
+  heads_lr: 0.0003
+  pose_lr: 0.0003
+  gate_lr: 0.003
+  native_lr: 0.000003
+  warmup_steps: 30
+  grad_clip: 5.0
+world_augmentation: uniform_SO3_translation_plus_minus_3m
+log_every: 10
+checkpoint_every: 250
+description: Step 1.5 full system, random training world gauge; evaluation first mapping camera gauge. Real frozen DINOv2 + VGGT/DPT, ray-anchor T0, residual T1, per-channel O5/O6 gates.

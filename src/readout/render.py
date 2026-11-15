@@ -31,7 +31,8 @@ class RenderReader(nn.Module):
         self.latent_dim = latent_dim
         self.project = nn.Sequential(nn.Linear(latent_dim+5, token_dim), nn.GELU(), nn.Linear(token_dim, token_dim))
         self.unseen = nn.Parameter(torch.zeros(token_dim))
-        self.gate = nn.Parameter(torch.tensor(0.))
+        self.norm = nn.LayerNorm(token_dim)
+        self.gate = nn.Parameter(torch.zeros(token_dim))
 
     def render(self, memory: GaussianMemory, query_c2w: Tensor, K_patch: Tensor,
                height: int, width: int) -> RenderedMemory:
@@ -61,4 +62,4 @@ class RenderReader(nn.Module):
         visible = self.project(attributes.reshape(-1, self.latent_dim+5))
         opacity = rendered.opacity.reshape(-1, 1)
         received = opacity*visible + (1-opacity)*self.unseen
-        return tokens + torch.tanh(self.gate)*received, rendered
+        return tokens + torch.tanh(self.gate)*self.norm(received), rendered

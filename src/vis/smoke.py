@@ -243,6 +243,9 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
     valid = array(target.valid).astype(bool)
     delta = np.linalg.norm(after-before, axis=-1)
     target_points = array(target.world_points)
+    error_before = np.linalg.norm(before-target_points, axis=-1)
+    error_after = np.linalg.norm(after-target_points, axis=-1)
+    error_delta = error_after-error_before
     local = ((target_points >= lower) & (target_points <= upper)).all(-1) & valid
     outside = valid & ~local
     fig = plt.figure(figsize=(15, 4), layout="constrained")
@@ -269,10 +272,11 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
         ax.set_xlim(limits[0, 0]-.1, limits[1, 0]+.1)
         ax.set_ylim(limits[0, 1]-.1, limits[1, 1]+.1)
     ax = fig.add_subplot(144)
-    heat = ax.imshow(np.where(valid, delta, np.nan), cmap="magma", vmin=0)
+    bound = max(.001, float(np.quantile(np.abs(error_delta[valid]), .98)))
+    heat = ax.imshow(np.where(valid, error_delta, np.nan), cmap="coolwarm", vmin=-bound, vmax=bound)
     if local.any():
         ax.contour(local.astype(float), levels=[.5], colors=["cyan"], linewidths=.7)
-    ax.set_title("Point change [m]; cyan=GT bbox ROI")
+    ax.set_title("EPE change [m]; red=worse; cyan=bbox")
     ax.axis("off")
     fig.colorbar(heat, ax=ax, fraction=.05)
     fig.suptitle(f"V5 · {scene['name']} · 3D bbox intervention, zero retraining, fixed model")
@@ -281,6 +285,12 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
     return {"erased_count": int(mask.sum()), "local_pixels": int(local.sum()),
             "mean_change_inside_m": float(delta[local].mean()) if local.any() else None,
             "mean_change_outside_m": float(delta[outside].mean()) if outside.any() else None,
+            "full_epe_inside_m": float(error_before[local].mean()) if local.any() else None,
+            "erased_epe_inside_m": float(error_after[local].mean()) if local.any() else None,
+            "epe_increase_inside_m": float(error_delta[local].mean()) if local.any() else None,
+            "full_epe_outside_m": float(error_before[outside].mean()) if outside.any() else None,
+            "erased_epe_outside_m": float(error_after[outside].mean()) if outside.any() else None,
+            "epe_increase_outside_m": float(error_delta[outside].mean()) if outside.any() else None,
             "pose_rotation_change_deg": float(rotation_change), "pose_translation_change_m": float(translation_change),
             "box_lower": lower.tolist(), "box_upper": upper.tolist()}
 
@@ -328,11 +338,17 @@ def deliver_visualizations(model, samples, output_dir, records):
                              "alpha_range": [float(memory.alpha.min()), float(memory.alpha.max())],
                              "axis_scale_range_m": [float(scales.min()), float(scales.max())],
                              "attention_normalized_entropy_mean": entropy,
-                             "o5_gate": float(model.render_reader.gate), "o6_gate": float(model.pe_reader.gate)}
+                             "attention_entropy_per_head": (-(attention.float().clamp_min(1e-10)*attention.float().clamp_min(1e-10).log()).sum(-1)/np.log(attention.shape[-1])).mean(-1).cpu().tolist() if attention is not None and attention.shape[-1]>1 else None,
+                             "o5_gate": gate_statistics(model.render_reader.gate), "o6_gate": gate_statistics(model.pe_reader.gate)}
         metrics["all_training_queries"] = []
         for query_index, (training_query, training_target) in enumerate(scene["queries"]):
             training_prediction = full if query_index == 1 else model(training_query, memory)
             _, query_metrics = world_loss(training_prediction, training_target)
+            query_metrics['rotation_gain_deg'] = query_metrics['rotation0_deg']-query_metrics['rotation1_deg']
+            query_metrics['translation_gain_m'] = query_metrics['translation0_m']-query_metrics['translation1_m']
+            empty_prediction = empty if query_index == 1 else model(training_query, memory.subset(slice(0, 0)))
+            _, empty_query_metrics = world_loss(empty_prediction, training_target)
+            query_metrics['empty_epe_m'] = empty_query_metrics['point_epe_m']
             metrics["all_training_queries"].append(dict(query_index=query_index, **query_metrics))
         metrics["wall"] = v1(scene_folder, scene, query, target, full)
         v2(scene_folder, scene, memory)
@@ -344,11 +360,17 @@ def deliver_visualizations(model, samples, output_dir, records):
         # Same-scene held-out query is diagnostic, not disjoint-scene validation.
         heldout_query, heldout_target = scene["heldout"][0]
         _, metrics["heldout_query_diagnostic"] = world_loss(model(heldout_query, memory), heldout_target)
+        _, metrics["heldout_empty_diagnostic"] = world_loss(model(heldout_query, memory.subset(slice(0, 0))), heldout_target)
         all_metrics[scene["name"]] = metrics
         print("Visualizations generated:", scene_folder, flush=True)
     plot_training_curves(output_dir, records)
     (output_dir/"evaluation.json").write_text(json.dumps(all_metrics, indent=2)+"\n")
     print("V1–V5 images exist; open and inspect them before reporting completion.", flush=True)
+
+
+def gate_statistics(gate):
+    value = gate.detach().tanh()
+    return dict(mean=float(value.mean()), mean_abs=float(value.abs().mean()), max_abs=float(value.abs().max()), channels=value.numel())
 
 
 def plot_training_curves(output_dir, records):
