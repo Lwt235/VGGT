@@ -2,7 +2,51 @@
 
 本轮保持三个场景、建图 `[0,2,4]`、训练查询 `[1,3,5]`、同场景留出 `[6]`、seed17。v1 文件完整保留。未启动 Step 2 或组件消融；查询接口始终只有 RGB、K。共享数据/权重/官方依赖源码只读，未修改系统环境、GLIBC 或其他任务进程。
 
-**最新状态：v2h 复验执行中，Step 1.5 尚未通过。** 四项指定架构修复已实现，门控和物理注意力已有效工作；后续复验仍发现过校正及局部擦除经位姿反馈扩散。最新已完成 v2g 的训练 EPE 为 C5/Brown/C6=0.152/0.180/0.096 m，Brown 留出 5.587 m；当前正在验证融合网格规范依赖修复与末段学习率下降。最新严格验证为 **31 tests 通过、无跳过（REQUIRE_GSPLAT=1）**。下文保留各轮真实结果，不能将不同轮的最好单项拼成一次通过结果。
+**最新状态：指定架构修复与三场景复验已执行，Step 1.5 尚未全部达标，Step 2 未启动。** 最新 v2i 完成 1000 步、32 项 REQUIRE_GSPLAT=1 严格测试全部通过；三场景 V1–V5、曲线和通路诊断均已实际打开。T1 自由上下文旁路得到约束，但 Brown 正常局部擦除仍由 T0 引起全局退化。不存在资源/依赖阻塞，剩余是模型问题。训练与诊断均已自然退出，已实时确认无本项目残留 GPU 进程。下文保留全部修复轮次，不能将不同轮的最好单项拼成一次通过结果。
+
+## 最新 v2i 固定评估
+
+以下使用最后一步同一权重，评估 G=I，查询只有 RGB/K；训练 EPE/位姿为三个训练查询均值，留出是同场景 index6，未对齐、未换划分。
+
+| 场景 | 训练 EPE m | 留出 EPE m | 训练 R0→R1 ° | 训练 t0→t1 m |
+|---|---:|---:|---:|---:|
+| C5 | 0.0817 | 0.3060 | 0.518→0.416 | 0.0226→0.0184 |
+| Brown | 0.1216 | 5.0190 | 0.229→0.202 | 0.0200→0.0206 |
+| C6 | 0.0814 | 0.1379 | 0.413→0.221 | 0.0110→0.0097 |
+
+总 Loss 前后 30 步 **2.007→1.446**，本轮强化匹配监督，不能与此前不同 criterion 的绝对值比较。C5/C6 三个训练查询的 R/t 都改善；Brown 的 46 帧轻微退化，167 帧旋转改善且平移近乎持平，3193 帧零校准。C5/C6 留出旋转分别 1.664→1.751°、0.823→1.057°，平移分别 0.166→0.154 m、0.098→0.091 m；尚未形成留出上的稳定两项增益。Brown 留出旋转约 132°、平移约 7.66 m，仍失败。
+
+| 正常 V5：同权重局部擦除 | 框内/外 ΔEPE m | 框内/外平均绝对 ΔEPE m | 框外点位移均值 m |
+|---|---:|---:|---:|
+| C5 | +0.0150 / +0.0061 | 0.0203 / 0.0125 | 0.0194 |
+| Brown | +0.1051 / +0.0986 | 0.1099 / 0.1024 | 0.1378 |
+| C6 | +0.0145 / +0.0047 | 0.0196 / 0.0127 | 0.0218 |
+
+C5/C6 框内退化更强，但框外仍有变化；Brown 几乎整图同等退化，**局部因果标准未通过**。不能用有符号均值抵消掩盖框外位移，也不能以固定姿态诊断替换正常 V5。
+
+O5/O6 门控均为 1024 通道，tanh 平均绝对值 **0.0228/0.0367**，最大绝对值 **0.1439/0.1824**。O6 归一化熵 C5/Brown/C6=**0.513/0.506/0.481**；射线 3σ 注意力质量 66.5%/62.6%/74.8%，均匀对应仅 2.5%/1.9%/3.3%。V4 中高权重确实沿所选射线附近分布。所画查询完整→空记忆 EPE 为 **0.079→1.227、0.059→2.127、0.081→2.045 m**，整体记忆依赖明确。
+
+无 NaN/Inf，最小协方差特征值约 1.10e-4 m²，alpha 始终约 0.12–0.56。最后 90 步各记忆字段 μ/Σ/α/z 均有非零有限梯度；七个训练模块都有梯度与参数更新。Brown 的部分全盲步骤中残差精化无梯度，是零残差恒等约束的结果，其他查询/场景持续有梯度。
+
+### 继续定位得到的结论
+
+- **低表面共视与正常共视失败是两件事。** 最初原始分辨率只读检查中 Brown 3330 有 60.35% 视锥相交、仅 1.91% v1 记忆 3σ 支持、0% 深度一致表面共视；最新记忆在烟测分辨率下该留出支持约 0.022%。追加训练查询诊断表明 Brown 3193 的 12980 个有效点中 3σ 支持为 0，预测 O5 也全盲；但 V5 使用的 167 帧有 **70.58%** 有效点表面支持，不能把它的擦除失败归咎于没有地图。该检查只计算 evaluator 指标，不输入查询真值。
+- **严格残差 T1 已减轻其自身扩散，但 T0 仍敏感。** 固定模型自身完整记忆 T0 后，Brown 框外 ΔEPE 从正常约 9.86 cm 降至 4.61 mm，T1 自身平移变化仅 3.17 mm；此前 v2h 固定 T0 后该变化为 2.66 cm。正常擦除时 Brown T0 仍改变约 3.06°/9.41 cm，导致整图漂移。它是当前首要未解决瓶颈。
+- 匹配监督使有支持 patch 的锚点误差从 v2h 的 0.738/0.571/0.567 m 降至 **0.375/0.391/0.336 m**，正确 3σ 邻域注意力质量增至 27.8%/30.9%/31.0%。然而 4.2 cm 的平均锚点变化仍在 Brown 被全局聚合放大为约 9.4 cm 平移和 3° 旋转。下一定向问题是 T0 的可靠对应识别与对局部缺失稳健的空间锚点聚合，仍须在完整系统验证，不能仅继续降低熵或用 GT 姿态回退。
+
+### 已打开的实际图像
+
+V1 的世界结构大体叠合，但墙面剖面仍宽且有偏移；V2 粗椭球、薄轴颜色及 alpha 可见；V3 几何渲染明确不是 RGB 记忆，空记忆世界输出明显改变；V4 有射线选择性；V5 的 Brown 全图红色退化仍明显。曲线显示匹配损失下降及末段位姿/EPE 收敛。这些观察没有被写成“局部因果已通过”。
+
+| 场景 | V1 | V2 | V3 | V4 | V5 |
+|---|---|---|---|---|---|
+| C5 | [V1](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c5/V1_world_overlap.png) | [V2](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c5/V2_ellipsoid_shells.png) | [V3](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c5/V3_bootstrap_calibration.png) | [V4](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c5/V4_attention_rays.png) | [V5](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c5/V5_local_erasure.png) |
+| Brown | [V1](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/brown_bm_1/V1_world_overlap.png) | [V2](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/brown_bm_1/V2_ellipsoid_shells.png) | [V3](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/brown_bm_1/V3_bootstrap_calibration.png) | [V4](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/brown_bm_1/V4_attention_rays.png) | [V5](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/brown_bm_1/V5_local_erasure.png) |
+| C6 | [V1](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c6/V1_world_overlap.png) | [V2](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c6/V2_ellipsoid_shells.png) | [V3](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c6/V3_bootstrap_calibration.png) | [V4](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c6/V4_attention_rays.png) | [V5](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/harvard_c6/V5_local_erasure.png) |
+
+[训练曲线](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/training_curves.png) · [固定预测姿态通路诊断图](/home/liwt/VGGT/results/smoke_seed17_v2i/vis/erasure_path_diagnostic.png) · [正式指标](/home/liwt/VGGT/results/smoke_seed17_v2i/evaluation.json) · [查询支持与通路指标](/home/liwt/VGGT/results/smoke_seed17_v2i/erasure_path_diagnostic.json)。
+
+本次主运行包括 v2 1500 步，v2b–v2f 各 1200 步，v2g–v2i 各 1000 步，累计 10500 步定向修复续训；不是九个独立从头实验，短集成不计作正式冒烟。所有失败结果保留，未做组件消融或正式 Step 2 训练。最后一次只读进程检查：无本项目训练/诊断 worker、无本项目 GPU PID，GPU0 已释放到约 48 GB 空闲，其他作业未被终止。
 
 ## 只读共视检查
 
@@ -233,4 +277,4 @@ T0 bootstrap 自身熵为 0.456/0.435/0.485，已经不是均匀注意力；但�
 
 v2i 将 T1 约束为**显式米制残差驱动**：上下文网络只能有界调节各位置残差权重，不能独立输出 ΔT；取消该路径的自由预测头与可学常数偏置，零残差或全盲区严格给出恒等校准。对深度混合方差和过大对应残差做物理置信度/稳健缩放。T1 仍是可微前向网络，不引入求解器或真值输入。针对锚点误差，将仅在 criterion 中的已有地图支持锚点/对应监督由 0.2/0.2 提至 1/2。完整 Writer、O5/O6、接收块、DPT、两级 Pose 均继续训练；这是修复自由旁路，不是训练组件消融。
 
-增加“学习后无残差仍不能猜姿态、有残差有梯度”的模块测试；32 项严格测试通过后执行真实集成，准备在 `results/smoke_seed17_v2i/` 继续 1000 步完整系统。没有用缺失几何的世界点监督或退化奖励制造 V5 现象。
+增加“学习后无残差仍不能猜姿态、有残差有梯度”的模块测试；32 项严格测试与真实集成通过后，在 `results/smoke_seed17_v2i/` 完成 1000 步完整系统，实际最终指标及未达标原因见本文首页。没有用缺失几何的世界点监督或退化奖励制造 V5 现象。

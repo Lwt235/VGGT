@@ -80,6 +80,23 @@ def main():
             uniform_mass_in_supported_3sigma=float(neighboring.float().mean(-1)[supported].mean()),
             anchor_error_supported_m=float((full['anchors']-world.reshape(-1, 3)).norm(dim=-1)[supported].mean()),
             erased_key_mass_mean=float(bootstrap[:, mask].sum(-1).mean()))}
+        query_support = []
+        precision = torch.linalg.inv(memory.covars)
+        for query_idx, (sample, truth) in enumerate(scene['queries']):
+            # GT is used only to count surface support after inference.
+            output = full if query_idx == 1 else model(sample, memory)
+            points = truth.world_points[truth.valid]
+            covered = 0
+            for start in range(0, len(points), 2048):
+                diff = points[start:start+2048, None]-memory.means[None]
+                distance = torch.einsum('pmi,mij,pmj->pm', diff, precision, diff)
+                covered += int((distance <= 9.).any(-1).sum())
+            query_support.append(dict(query_list_index=query_idx,
+                frame_id=scene['query_frame_ids'][query_idx], valid_points=len(points),
+                surface_3sigma_coverage=covered/len(points),
+                predicted_opacity_mean=float(output['rendered'].opacity.mean()),
+                predicted_patch_coverage_over_0p1=float((output['rendered'].opacity > .1).float().mean())))
+        report[scene['name']]['training_query_support'] = query_support
         for column, (label, prediction) in enumerate(predictions):
             change = (prediction['world_points']-target.world_points).norm(dim=-1)-before
             inside_value, outside_value = float(change[local].mean()), float(change[outside].mean())
