@@ -15,7 +15,7 @@ from torch.nn import functional as F
 from src.data import QueryInput
 from src.geometry import patch_intrinsics, transform_points
 from src.memory.gaussians import GaussianMemory, SpatialMomentFusion, TokenGaussianWriter
-from src.models.spatial_pose import SpatialBootstrap, SpatialRefinement
+from src.models.spatial_pose import SpatialBootstrap, LegacySpatialBootstrap, SpatialRefinement
 from src.readout.parameter_pe import ParameterPEReader
 from src.readout.render import RenderReader
 from src.runtime import configure_local_storage, load_checkpoint_readonly
@@ -89,7 +89,7 @@ class VGGTSpatialMemory(nn.Module):
         self.native.point_head.requires_grad_(True)
         self.native.aggregator.global_blocks[receive_layer].requires_grad_(True)
         self.receive_layer = receive_layer
-        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h', 'v2i'):
+        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h', 'v2i', 'v2j'):
             raise ValueError('Unknown model revision')
         self.revision = revision
         self.pose_jitter_probability = pose_jitter_probability
@@ -97,8 +97,8 @@ class VGGTSpatialMemory(nn.Module):
         self.fusion = SpatialMomentFusion()
         self.render_reader = RenderReader(metric_depth=revision!='v2')
         self.pe_reader = ParameterPEReader(opacity_occlusion=revision!='v2')
-        self.initial_pose = SpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
-        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i'), residual_only=revision=='v2i')
+        self.initial_pose = SpatialBootstrap() if revision=='v2j' else LegacySpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
+        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i', 'v2j'), residual_only=revision in ('v2i', 'v2j'))
 
     def train(self, mode=True):
         super().train(mode)
@@ -124,7 +124,7 @@ class VGGTSpatialMemory(nn.Module):
                                   for key in ("means", "covars", "alpha", "features")))
         # No image/token fields leave this function. Autograd retains only what
         # the current training step requires, never a subsequent query bypass.
-        reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i') else None
+        reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i', 'v2j') else None
         return self.fusion(memory, reference_c2w=reference)
 
     def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False):
@@ -135,8 +135,11 @@ class VGGTSpatialMemory(nn.Module):
         hp, wp = height//14, width//14
         shallow = frozen_patch_tokens(self.native.aggregator, rgb)
         Kp = patch_intrinsics(K)
-        T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
-        if self.training and self.revision != 'v2' and torch.rand((), device=rgb.device) < self.pose_jitter_probability:
+        if self.revision == 'v2j':
+            T0, diagnostic = None, {}
+        else:
+            T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
+        if self.training and self.revision not in ('v2', 'v2j') and torch.rand((), device=rgb.device) < self.pose_jitter_probability:
             # Predicted-pose denoising: stochastic small *local* perturbations,
             # independent of GT, teach the residual head a stationary signal.
             from src.geometry import quat_wxyz_to_matrix
@@ -145,7 +148,12 @@ class VGGTSpatialMemory(nn.Module):
             jitter[:3, 3] = torch.randn(3, device=rgb.device)*.08
             T0 = T0 @ jitter
         def receive(tokens):
+            nonlocal T0
             with torch.autocast(device_type=rgb.device.type, enabled=False):
+                if self.revision == 'v2j':
+                    T0, bootstrap = self.initial_pose(tokens.float(), self.writer.latent(shallow[0].float()),
+                                                     memory, Kp, hp, wp, shallow=shallow[0].float())
+                    diagnostic.update(bootstrap)
                 read, rendered = self.render_reader(tokens.float(), memory, T0, Kp, hp, wp)
                 read, attention = self.pe_reader(read, memory, T0, Kp, hp, wp, rendered.depth,
                                                  rendered=rendered, return_attention=return_attention)

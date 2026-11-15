@@ -286,7 +286,8 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
     fig.supxlabel(f"EPE increase inside/outside = {error_delta[local].mean():+.4f}/{error_delta[outside].mean():+.4f} m; full camera prediction is allowed to change", fontsize=10)
     save(fig, folder/"V5_local_erasure.png")
     rotation_change, translation_change = pose_errors(erased["T1"], full["T1"])
-    return {"erased_count": int(mask.sum()), "local_pixels": int(local.sum()),
+    rotation0_change, translation0_change = pose_errors(erased['T0'], full['T0'])
+    result = {"erased_count": int(mask.sum()), "local_pixels": int(local.sum()),
             "mean_change_inside_m": float(delta[local].mean()) if local.any() else None,
             "mean_change_outside_m": float(delta[outside].mean()) if outside.any() else None,
             "full_epe_inside_m": float(error_before[local].mean()) if local.any() else None,
@@ -298,17 +299,21 @@ def v5(folder, scene, query, target, memory, full, erased, box, erased_mask):
             "mean_abs_epe_change_inside_m": float(np.abs(error_delta[local]).mean()) if local.any() else None,
             "mean_abs_epe_change_outside_m": float(np.abs(error_delta[outside]).mean()) if outside.any() else None,
             "pose_rotation_change_deg": float(rotation_change), "pose_translation_change_m": float(translation_change),
-            "box_lower": lower.tolist(), "box_upper": upper.tolist()}
+            "box_lower": lower.tolist(), "box_upper": upper.tolist(),
+            "pose0_rotation_change_deg": float(rotation0_change), "pose0_translation_change_m": float(translation0_change)}
+    if 'camera_patch_points' in full:
+        result['pre_injection_camera_points_max_change_m'] = float((full['camera_patch_points']-erased['camera_patch_points']).abs().max())
+    return result
 
 
 @torch.no_grad()
-def deliver_visualizations(model, samples, output_dir, records, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2):
+def deliver_visualizations(model, samples, output_dir, records, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2, depth_weight=1.):
     folder = output_dir/"vis"
     folder.mkdir(parents=True, exist_ok=True)
     all_metrics = {}
     def criterion(prediction, target):
         return world_loss(prediction, target, camera_weight=camera_weight, refinement_safety_weight=refinement_safety_weight,
-                          anchor_weight=anchor_weight, matching_weight=matching_weight)
+                          anchor_weight=anchor_weight, matching_weight=matching_weight, depth_weight=depth_weight)
     for scene in samples:
         scene_folder = folder/scene["name"]
         scene_folder.mkdir(exist_ok=True)
@@ -399,6 +404,16 @@ def deliver_visualizations(model, samples, output_dir, records, *, camera_weight
         print("Visualizations generated:", scene_folder, flush=True)
     plot_training_curves(output_dir, records)
     (output_dir/"evaluation.json").write_text(json.dumps(all_metrics, indent=2)+"\n")
+    if model.revision == 'v2j':
+        grouped = {'covisible_queries': [], 'low_overlap_blind_queries': []}
+        for scene in samples:
+            metrics = all_metrics[scene['name']]
+            entries = [(scene['query_frame_ids'][i], 'train', q) for i, q in enumerate(metrics['all_training_queries'])]
+            entries.append((scene['heldout_frame_ids'][0], 'heldout_index6', metrics['heldout_query_diagnostic']))
+            for frame, split, value in entries:
+                group = 'covisible_queries' if value['surface_support_rate'] >= .05 else 'low_overlap_blind_queries'
+                grouped[group].append(dict(scene=scene['name'], frame_id=frame, split=split, **value))
+        (output_dir/'evaluation_by_visibility.json').write_text(json.dumps(grouped, indent=2)+'\n')
     print("V1–V5 images exist; open and inspect them before reporting completion.", flush=True)
 
 

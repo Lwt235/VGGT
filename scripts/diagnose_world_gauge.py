@@ -50,6 +50,8 @@ def main():
         h, w = query.rgb.shape[-2:]
         Kp = patch_intrinsics(query.K)
         def pose(memory):
+            if model.revision == 'v2j':
+                return model(query, memory)['T0']
             return model.initial_pose(tokens, features, memory, Kp, h//14, w//14)[0]
         base = model.build_memory(scene['mapping'])
         Tbase = pose(base)

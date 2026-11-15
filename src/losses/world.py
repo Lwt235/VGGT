@@ -21,7 +21,7 @@ def pose_errors(prediction, target):
     return degrees, translation
 
 
-def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2):
+def _legacy_world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2):
     valid = target.valid
     if not valid.any():
         raise ValueError("No valid metric supervision pixels")
@@ -73,3 +73,84 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
                   "coarse_point_epe_m": (output['coarse_world_points'][valid]-target.world_points[valid]).detach().norm(dim=-1).mean().item(),
                   "rotation0_deg": r0.item(), "rotation1_deg": r1.item(),
                   "translation0_m": t0.item(), "translation1_m": t1.item()}
+
+
+def open_set_matching_loss(output, target, erased_reference=None):
+    """GT surface support and positive/negative labels live ONLY in criterion."""
+    h, w = output['rendered'].opacity.shape[:2]
+    valid = target.valid
+    fraction = F.adaptive_avg_pool2d(valid.float()[None, None], (h, w))[0, 0]
+    patch_valid = fraction.flatten() > .25
+    world = F.adaptive_avg_pool2d((target.world_points*valid[..., None]).permute(2, 0, 1)[None], (h, w))[0].permute(1, 2, 0)/fraction.clamp_min(1e-6)[..., None]
+    means, covars = output['anchor_support_means'].detach(), output['anchor_support_covars'].detach()
+    with torch.no_grad():
+        if len(means):
+            precision = torch.linalg.inv(covars)
+            diff = world.reshape(-1, 3)[:, None]-means[None]
+            rho2 = torch.einsum('qmi,mij,qmj->qm', diff, precision, diff)
+            minimum = rho2.min(-1).values
+            teacher = (-rho2/2).softmax(-1)
+            points = target.world_points[valid]
+            covered = points.new_zeros(())
+            for start in range(0, len(points), 2048):
+                delta = points[start:start+2048, None]-means[None]
+                distance = torch.einsum('pmi,mij,pmj->pm', delta, precision, delta)
+                covered += (distance <= 9).any(-1).float().sum()
+            support_rate = covered/max(1, len(points))
+        else:
+            minimum = world.new_full((h*w,), float('inf'))
+            teacher = world.new_zeros(h*w, 0)
+            support_rate = world.new_zeros(())
+        observable = bool(support_rate >= .05)
+        positive = patch_valid & (minimum <= 9)
+        negative = patch_valid & (minimum > 16)
+        if erased_reference is not None:
+            original_means, original_covars, erased = erased_reference
+            delta = world.reshape(-1, 3)[:, None]-original_means.detach()[None]
+            original_rho2 = torch.einsum('qmi,mij,qmj->qm', delta, torch.linalg.inv(original_covars.detach()), delta)
+            nearest_rho, nearest = original_rho2.min(-1)
+            removed = patch_valid & (nearest_rho <= 9) & erased[nearest]
+            positive &= ~removed
+            negative |= removed
+        if not observable:
+            positive.zero_()
+            negative = patch_valid
+    W = output['matching_attention'].clamp_min(1e-9)
+    terms = W.new_zeros(h*w)
+    if positive.any():
+        terms[positive] = -(teacher[positive]*W[positive, :-1].log()).sum(-1)
+    if negative.any():
+        terms[negative] = -W[negative, -1].log()
+    labeled = positive | negative
+    match = terms[labeled].mean() if labeled.any() else W.sum()*0
+    anchor = (output['anchors'][positive]-world.reshape(-1, 3)[positive]).abs().mean() if positive.any() else output['anchors'].sum()*0
+    return match, anchor, support_rate, observable
+
+
+def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2, depth_weight=1.):
+    if 'matching_attention' not in output:
+        return _legacy_world_loss(output, target, camera_weight=camera_weight, refinement_safety_weight=refinement_safety_weight,
+                                  anchor_weight=anchor_weight, matching_weight=matching_weight)
+    base, metrics = _legacy_world_loss(output, target, camera_weight=camera_weight,
+                                       refinement_safety_weight=refinement_safety_weight, anchor_weight=0., matching_weight=0.)
+    match, anchor, support_rate, observable = open_set_matching_loss(output, target)
+    hp, wp = output['rendered'].opacity.shape[:2]
+    valid = target.valid.float()
+    fraction = F.adaptive_avg_pool2d(valid[None, None], (hp, wp))[0, 0].flatten()
+    depth = (F.adaptive_avg_pool2d((target.depth*valid)[None, None], (hp, wp))[0, 0].flatten()/fraction.clamp_min(1e-6))
+    mask = fraction > .25
+    depth_error = (output['z_cam'][mask]-depth[mask]).abs()
+    z_loss = depth_error.mean()
+    confidence_loss = F.binary_cross_entropy(output['c_depth'][mask].clamp(1e-6, 1-1e-6), torch.exp(-depth_error.detach()/.5))
+    camera_truth = transform_points(target.world_points, invert_se3(target.c2w))
+    camera_delta = output['camera_points'][target.valid]-camera_truth[target.valid]
+    # No random-world pose/point/anchor loss on the unobservable frame.
+    loss = base+anchor_weight*anchor if observable else camera_weight*camera_delta.abs().mean()
+    loss = loss+matching_weight*match+depth_weight*(z_loss+.05*confidence_loss)
+    metrics.update(loss=float(loss.detach()), anchor_l1_m=float(anchor.detach()), correspondence_loss=float(match.detach()),
+                   surface_support_rate=float(support_rate), world_supervision_enabled=float(observable),
+                   z_cam_l1_m=float(z_loss.detach()), camera_epe_m=float(camera_delta.detach().norm(dim=-1).mean()),
+                   dustbin_mean=float(output['dustbin_probability'].detach().mean()),
+                   dustbin_rejection_rate=float((output['dustbin_probability'].detach() > .5).float().mean()),
+                   match_mass=float(output['match_mass'].detach()))
+    return loss, metrics

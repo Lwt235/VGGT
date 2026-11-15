@@ -45,7 +45,8 @@ def load_scene_samples(config, device):
         result.append({"path": path, "name": scene.path.parent.name, "mapping": mapping,
                        "queries": queries, "heldout": heldout,
                        "mapping_frame_ids": [scene.frame_ids[i] for i in config["mapping_indices"]],
-                       "query_frame_ids": [scene.frame_ids[i] for i in config["query_indices"]]})
+                       "query_frame_ids": [scene.frame_ids[i] for i in config["query_indices"]],
+                       "heldout_frame_ids": [scene.frame_ids[i] for i in config["heldout_query_indices"]]})
     return result
 
 
@@ -104,6 +105,10 @@ def main():
         retired = []
         with torch.no_grad():
             for name, value in previous['trainable'].items():
+                compatible_match = name.startswith(('initial_pose.query_residual.', 'initial_pose.key_residual.')) or name == 'initial_pose.log_temperature'
+                if config.get('architecture_revision') == 'v2j' and name.startswith('initial_pose.') and not compatible_match:
+                    retired.append(name)
+                    continue
                 if name not in parameters:
                     if config.get('architecture_revision') != 'v2i' or not (name.startswith('refine_pose.pose.') or name == 'refine_pose.residual_pose.bias'):
                         raise ValueError(f'Unexpected incompatible checkpoint parameter: {name}')
@@ -114,11 +119,14 @@ def main():
         print('Warm start from own-project checkpoint; newly initialized:', added, flush=True)
         if retired:
             print('Retired architecture parameters:', retired, flush=True)
+        if config.get('architecture_revision') == 'v2j':
+            print('New geometry/dustbin initialized; compatible query/key projections and temperature restored; free pose MLP retired.', flush=True)
         del previous
     samples = load_scene_samples(config, "cuda")
     residual_params = list(model.refine_pose.residual_pose.parameters()) if model.refine_pose.residual_pose is not None else []
+    bootstrap_params = list(model.initial_pose.parameters()) if config.get('architecture_revision') == 'v2j' else []
     pose_params = [p for p in list(model.initial_pose.parameters())+list(model.refine_pose.parameters())
-                   if id(p) not in {id(g) for g in residual_params}]
+                   if id(p) not in {id(g) for g in residual_params+bootstrap_params}]
     native_params = [p for p in model.native.parameters() if p.requires_grad]
     gate_params = [model.render_reader.gate, model.pe_reader.gate]
     other_params = [p for name, p in model.named_parameters() if p.requires_grad and
@@ -131,6 +139,10 @@ def main():
               {"params": native_params, "lr": optim_config["native_lr"]}]
     if residual_params:
         groups.append({'params': residual_params, 'lr': optim_config['refinement_geometry_lr']})
+    if bootstrap_params:
+        dustbin = [model.initial_pose.dustbin_logit]
+        groups.append({'params': [p for p in bootstrap_params if p is not dustbin[0]], 'lr': optim_config['bootstrap_lr']})
+        groups.append({'params': dustbin, 'lr': optim_config['dustbin_lr'], 'weight_decay': 0.})
     optimizer = torch.optim.AdamW(groups, weight_decay=.01)
     def lr_multiplier(step):
         warmup = optim_config['warmup_steps']
@@ -161,7 +173,7 @@ def main():
             loss, metrics = world_loss(prediction, target, camera_weight=config.get('camera_alignment_weight', .5),
                                        refinement_safety_weight=config.get('refinement_safety_weight', 0.),
                                        anchor_weight=config.get('anchor_alignment_weight', .2),
-                                       matching_weight=config.get('matching_weight', .2))
+                                       matching_weight=config.get('matching_weight', .2), depth_weight=config.get('patch_depth_weight', 1.))
             if config.get('mapping_self_observation'):
                 mapping_loss, mapping_metrics = supervise_mapping_observation(model, memory, mapping[(step//3) % len(mapping)])
                 loss = loss+mapping_loss
@@ -173,7 +185,7 @@ def main():
             # Sequential backwards avoid retaining two native VGGT graphs.
             # Only pose is supervised on this partial-map branch; it is NOT
             # trained to invent missing local geometry or to create degradation.
-            if config.get('paired_pose_consistency') and (step//3) % 2 == 0:
+            if config.get('paired_pose_consistency') and (step//3) % 2 == 0 and metrics.get('world_supervision_enabled', 1.) > 0:
                 teacher = {key: prediction[key].detach() for key in ('T0', 'T1')}
                 probability = prediction['bootstrap_attention'].detach().mean(0)
                 index = torch.multinomial(probability+.001, 1)[0]
@@ -182,7 +194,8 @@ def main():
                 partial_memory, erased_mask = partial_memory.erase_box(center-.5, center+.5)
                 if len(partial_memory) >= len(memory)*.5 and erased_mask.any():
                     partial_prediction = model(query, partial_memory)
-                    consistency, consistency_metrics = pose_consistency_loss(partial_prediction, teacher, target)
+                    consistency, consistency_metrics = pose_consistency_loss(partial_prediction, teacher, target,
+                        erased_reference=(memory.means, memory.covars, erased_mask), matching_weight=config.get('matching_weight', .2))
                     if not torch.isfinite(consistency):
                         raise RuntimeError('Nonfinite paired pose consistency')
                     consistency.backward()
@@ -237,7 +250,8 @@ def main():
         model.eval()
         deliver_visualizations(model, samples, output_dir, records, camera_weight=config.get('camera_alignment_weight', .5),
                                refinement_safety_weight=config.get('refinement_safety_weight', 0.),
-                               anchor_weight=config.get('anchor_alignment_weight', .2), matching_weight=config.get('matching_weight', .2))
+                               anchor_weight=config.get('anchor_alignment_weight', .2), matching_weight=config.get('matching_weight', .2),
+                               depth_weight=config.get('patch_depth_weight', 1.))
 
 
 if __name__ == "__main__":

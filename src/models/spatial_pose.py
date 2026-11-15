@@ -1,8 +1,7 @@
-"""Ray/anchor correspondences and spatial, camera-local residual refinement.
+"""Open-set correspondences, invariant forward moments, spatial refinement.
 
-No query pose/depth is accepted. Rotation vectors are learned weighted anchor
-differences, followed by continuous 6D Gram-Schmidt, not a rigid fit/SVD.
-This construction transports the prediction with a changed memory gauge.
+No query pose/depth is accepted. v2j uses pre-injection camera geometry and
+two-ended whitened IRLS moments; legacy heads restore earlier project runs.
 """
 import math
 import torch
@@ -23,7 +22,7 @@ def anchor_vote_weights(weights, memory, anchors, confidence):
     return votes.clamp_min(.005)
 
 
-class SpatialBootstrap(nn.Module):
+class LegacySpatialBootstrap(nn.Module):
     def __init__(self, token_dim=1024, latent_dim=256, *, local_rotation=True, robust_voting=False):
         super().__init__()
         self.query_residual = nn.Linear(token_dim+3, latent_dim)
@@ -102,6 +101,107 @@ class SpatialBootstrap(nn.Module):
         translation = centroid_weights @ anchors + anchor_R @ local_translation
         T = torch.cat((torch.cat((R, translation[:, None]), -1), eye[3:]), 0)
         return T, dict(anchors=anchors, confidence=confidence, bootstrap_attention=weights, bootstrap_support=support, anchor_votes=votes)
+
+
+def whitened_irls_pose(camera_points, anchors, weights, *, tau=.25, damping=1e-6, iterations=2):
+    """Two-ended centered right-whitened moments, followed by two IRLS updates.
+
+    This is part of the differentiable prediction, never post-prediction fitting.
+    No SVD/eigendecomposition or query ground truth is used.
+    """
+    original_dtype = anchors.dtype
+    # Tiny moment systems in double avoid TF32/rank-near-planar cancellation;
+    # neural features and rendered state remain float32/bfloat16.
+    camera_points, anchors, weights = camera_points.double(), anchors.double(), weights.double()
+    eye = torch.eye(3, device=anchors.device, dtype=anchors.dtype)
+    def solve(votes):
+        votes = votes/votes.sum().clamp_min(1e-8)
+        Xbar = (votes[:, None]*anchors).sum(0)
+        Pbar = (votes[:, None]*camera_points).sum(0)
+        dX, dP = anchors-Xbar, camera_points-Pbar
+        H = (votes[:, None]*dX).T @ dP
+        C = (votes[:, None]*dP).T @ dP
+        lam = damping*C.trace()/3+1e-8
+        M = torch.linalg.solve(C+lam*eye, H.T).T
+        R = rotation_6d(torch.cat((M[:, 0], M[:, 1])))
+        independent = (M[:, 0].norm() > 1e-8) & (torch.linalg.cross(M[:, 0], M[:, 1]).norm() > 1e-10)
+        R = torch.where(independent, R, eye)
+        t = Xbar-R @ Pbar
+        return R, t
+    robust = weights
+    R, t = solve(robust)
+    for _ in range(iterations):
+        residual = anchors-(camera_points @ R.T+t)
+        robust = weights*tau**2/(tau**2+residual.square().sum(-1))
+        R, t = solve(robust)
+    T = torch.cat((torch.cat((R, t[:, None]), -1), anchors.new_tensor([[0., 0., 0., 1.]])), 0)
+    return T.to(original_dtype), robust.to(original_dtype)
+
+
+class SpatialBootstrap(nn.Module):
+    """Memory-independent camera geometry, open-set matches, invariant moments."""
+    def __init__(self, token_dim=1024, latent_dim=256):
+        super().__init__()
+        self.key_dropout_mode = 'none'
+        self.query_residual = nn.Linear(token_dim+3, latent_dim)
+        self.key_residual = nn.Linear(latent_dim+4, latent_dim)
+        for layer in (self.query_residual, self.key_residual):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        self.log_temperature = nn.Parameter(torch.tensor(math.log(20.)))
+        self.dustbin_logit = nn.Parameter(torch.tensor(10.))
+        self.camera_geometry = nn.Sequential(nn.LayerNorm(2*token_dim+3), nn.Linear(2*token_dim+3, 256),
+                                             nn.GELU(), nn.Linear(256, 2))
+        nn.init.zeros_(self.camera_geometry[-1].weight)
+        with torch.no_grad():
+            self.camera_geometry[-1].bias.copy_(torch.tensor([2.4, 1.5]))
+
+    def camera_observation(self, tokens_pre_inject, shallow, K, height, width):
+        eye = torch.eye(4, device=K.device, dtype=K.dtype)
+        _, rays, dz = world_rays(K, eye, height, width)
+        raw = self.camera_geometry(torch.cat((tokens_pre_inject, shallow, rays), -1))
+        z = F.softplus(raw[:, 0])+.05
+        confidence = raw[:, 1].sigmoid()
+        return rays/dz[:, None]*z[:, None], z, confidence, rays
+
+    def forward(self, tokens_pre_inject, query_features, memory, K, height, width, *, shallow):
+        points, z, c_depth, rays = self.camera_observation(tokens_pre_inject, shallow, K, height, width)
+        count = len(points)
+        eye = torch.eye(4, device=K.device, dtype=K.dtype)
+        if not len(memory):
+            return eye, dict(anchors=points.new_zeros(count, 3), confidence=z*0.,
+                camera_patch_points=points, z_cam=z, c_depth=c_depth,
+                matching_attention=points.new_ones(count, 1), dustbin_probability=z*0.+1,
+                bootstrap_attention=points.new_zeros(count, 0), bootstrap_support=torch.zeros(0, device=z.device, dtype=torch.bool),
+                anchor_votes=z*0., match_mass=z.new_zeros(()))
+        # Rotation-invariant covariance summaries; no eigen/SVD pose path.
+        covariance = memory.covars
+        trace = covariance.diagonal(dim1=-2, dim2=-1).sum(-1)
+        invariants = torch.stack((trace/3, covariance.square().sum((-1, -2)).sqrt()/math.sqrt(3),
+                                  torch.linalg.det(covariance).clamp_min(1e-24).pow(1/3)), -1)
+        scales = .5*invariants.clamp_min(1e-10).log()
+        q = F.normalize(query_features+self.query_residual(torch.cat((shallow, rays), -1)), dim=-1)
+        k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
+        logits = q @ k.T*self.log_temperature.exp().clamp(max=60.)+memory.alpha.clamp_min(1e-6).log()[None]
+        W = torch.cat((logits, self.dustbin_logit.expand(count, 1)), -1).softmax(-1)
+        p_match = 1-W[:, -1]
+        inlier = W[:, :-1]/p_match[:, None].clamp_min(1e-6)
+        anchors = inlier @ memory.means
+        entropy_confidence = 1+(inlier*inlier.clamp_min(1e-9).log()).sum(-1)/math.log(max(2, len(memory)))
+        weights = p_match*c_depth*anchor_vote_weights(inlier, memory, anchors, entropy_confidence)
+        T, votes = whitened_irls_pose(points, anchors, weights)
+        # On observable matches this is exactly one in floating point. Identity
+        # fallback in the unobservable regime is intentionally not gauge equivariant.
+        quality = ((p_match.sum()-.25)/.025).sigmoid()
+        quality = quality*p_match.sum()/(p_match.sum()+1e-8)
+        mixed_R = rotation_6d(torch.cat((quality*T[:3, 0]+(1-quality)*eye[:3, 0],
+                                       quality*T[:3, 1]+(1-quality)*eye[:3, 1])))
+        top = torch.cat((mixed_R, (quality*T[:3, 3])[:, None]), -1)
+        T = torch.cat((top, eye[3:]), 0)
+        return T, dict(anchors=anchors, confidence=p_match, camera_patch_points=points, z_cam=z, c_depth=c_depth,
+            matching_attention=W, dustbin_probability=W[:, -1], bootstrap_attention=inlier,
+            bootstrap_support=torch.ones(len(memory), device=z.device, dtype=torch.bool),
+            anchor_votes=votes, match_mass=p_match.sum())
 
 
 class SpatialRefinement(nn.Module):
