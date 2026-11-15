@@ -1,7 +1,7 @@
 """Fixed-weight iteration diagnosis, never a replacement inference result.
 
 No query GT enters this diagnostic. The bbox is the existing normal V5 bbox.
-Iteration counts only inspect solver behavior; the model remains at three.
+Iteration counts only inspect solver behavior; the configured model is unchanged.
 """
 import sys
 from pathlib import Path
