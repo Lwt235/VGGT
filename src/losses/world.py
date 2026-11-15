@@ -29,8 +29,9 @@ def world_loss(output, target):
     point = delta.abs().mean()
     coarse = output["T0"]
     refined = output["T1"]
-    pose = sum((T[:3, 3]-target.c2w[:3, 3]).norm() +
-               rotation_geodesic(T[:3, :3], target.c2w[:3, :3]) for T in (coarse, refined))
+    pose = sum(F.smooth_l1_loss((T[:3, 3]-target.c2w[:3, 3]).norm(), point.new_zeros(()), beta=.03) +
+               F.smooth_l1_loss(rotation_geodesic(T[:3, :3], target.c2w[:3, :3]), point.new_zeros(()), beta=.03)
+               for T in (coarse, refined))
     coarse_point = (output['coarse_world_points'][valid]-target.world_points[valid]).abs().mean()
     # Explicit patch-anchor supervision, evaluator/criterion only. It teaches
     # correspondences rather than feeding any query geometry to the model.

@@ -104,7 +104,9 @@ def main():
         print('Warm start from own-project checkpoint; newly initialized:', added, flush=True)
         del previous
     samples = load_scene_samples(config, "cuda")
-    pose_params = list(model.initial_pose.parameters())+list(model.refine_pose.parameters())
+    residual_params = list(model.refine_pose.residual_pose.parameters()) if model.refine_pose.residual_pose is not None else []
+    pose_params = [p for p in list(model.initial_pose.parameters())+list(model.refine_pose.parameters())
+                   if id(p) not in {id(g) for g in residual_params}]
     native_params = [p for p in model.native.parameters() if p.requires_grad]
     gate_params = [model.render_reader.gate, model.pe_reader.gate]
     other_params = [p for name, p in model.named_parameters() if p.requires_grad and
@@ -115,6 +117,8 @@ def main():
               {"params": pose_params, "lr": optim_config["pose_lr"]},
               {"params": gate_params, "lr": optim_config["gate_lr"], "weight_decay": 0.},
               {"params": native_params, "lr": optim_config["native_lr"]}]
+    if residual_params:
+        groups.append({'params': residual_params, 'lr': optim_config['refinement_geometry_lr']})
     optimizer = torch.optim.AdamW(groups, weight_decay=.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min((step+1)/optim_config["warmup_steps"], 1.))
     modules = {"writer": model.writer, "o5": model.render_reader, "o6": model.pe_reader,

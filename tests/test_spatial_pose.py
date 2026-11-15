@@ -72,6 +72,7 @@ def test_residual_refinement_receives_spatial_geometry_and_detaches_base_pose():
     (T1[:3, 3]-torch.tensor([.2, -.1, .3])).square().sum().backward()
     assert T0.grad is None
     assert model.pose.net[-1].weight.grad.abs().sum() > 0
+    assert model.residual_pose.weight.grad.abs().sum() > 0
     assert world.shape == residual.shape == (2, 3, 3)
 
 

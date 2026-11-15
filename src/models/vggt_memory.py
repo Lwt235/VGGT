@@ -69,7 +69,7 @@ def aggregate_single(aggregator, rgb, patch_tokens, injection=None, receive_laye
 
 
 class VGGTSpatialMemory(nn.Module):
-    def __init__(self, source, weights, *, receive_layer=4, revision='v2b'):
+    def __init__(self, source, weights, *, receive_layer=4, revision='v2c'):
         super().__init__()
         # No random fallback or automatic download: missing weights stop here.
         if weights is None or not Path(weights).is_file():
@@ -89,15 +89,15 @@ class VGGTSpatialMemory(nn.Module):
         self.native.point_head.requires_grad_(True)
         self.native.aggregator.global_blocks[receive_layer].requires_grad_(True)
         self.receive_layer = receive_layer
-        if revision not in ('v2', 'v2b'):
+        if revision not in ('v2', 'v2b', 'v2c'):
             raise ValueError('Unknown model revision')
         self.revision = revision
         self.writer = TokenGaussianWriter(1024)
         self.fusion = SpatialMomentFusion()
-        self.render_reader = RenderReader(metric_depth=revision=='v2b')
-        self.pe_reader = ParameterPEReader(opacity_occlusion=revision=='v2b')
-        self.initial_pose = SpatialBootstrap(local_rotation=revision=='v2b')
-        self.refine_pose = SpatialRefinement()
+        self.render_reader = RenderReader(metric_depth=revision!='v2')
+        self.pe_reader = ParameterPEReader(opacity_occlusion=revision!='v2')
+        self.initial_pose = SpatialBootstrap(local_rotation=revision!='v2')
+        self.refine_pose = SpatialRefinement(direct_residual=revision=='v2c')
 
     def train(self, mode=True):
         super().train(mode)
@@ -134,7 +134,7 @@ class VGGTSpatialMemory(nn.Module):
         shallow = frozen_patch_tokens(self.native.aggregator, rgb)
         Kp = patch_intrinsics(K)
         T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
-        if self.training and self.revision == 'v2b':
+        if self.training and self.revision != 'v2':
             # Predicted-pose denoising: stochastic small *local* perturbations,
             # independent of GT, teach the residual head a stationary signal.
             from src.geometry import quat_wxyz_to_matrix
@@ -160,7 +160,7 @@ class VGGTSpatialMemory(nn.Module):
             camera_points, _ = self.native.point_head(dpt_outputs, images=rgb[None, None], patch_start_idx=start)
             camera_points = camera_points[0, 0]
             local_confidence = camera_points.new_zeros(hp, wp, 1)
-            if self.revision == 'v2b':
+            if self.revision != 'v2':
                 camera_points, local_confidence = self.render_reader.anchor_camera_geometry(camera_points, diagnostic['rendered'], K)
             final = outputs[-1][0, 0, start:].float()
             T1, X_T0, residual = self.refine_pose(final, camera_points, T0, diagnostic['rendered'], Kp, hp, wp)

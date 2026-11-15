@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from src.geometry import invert_se3, transform_points, world_rays
-from src.models.pose import PoseHead, rotation_6d
+from src.models.pose import PoseHead, rotation_6d, pose_from_vector
 
 
 class SpatialBootstrap(nn.Module):
@@ -83,12 +83,21 @@ class SpatialBootstrap(nn.Module):
 
 
 class SpatialRefinement(nn.Module):
-    def __init__(self, token_dim=2048):
+    def __init__(self, token_dim=2048, *, direct_residual=True):
         super().__init__()
         self.token_project = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, 32), nn.GELU())
         # camera point, rendered point in T0 camera, metric residual, ray, O, var
         self.spatial = nn.Sequential(nn.Conv2d(46, 64, 3, padding=1), nn.GELU(), nn.Conv2d(64, 64, 3, padding=1), nn.GELU())
         self.pose = PoseHead(64*4*5)
+        self.residual_pose = None
+        if direct_residual:
+            # Preserve metric residual amplitude. A LayerNorm over the entire
+            # appearance/geometry embedding can suppress a 5 cm displacement.
+            # This is a learned spatial linear layer, not a pose fitting solver.
+            self.residual_pose = nn.Linear(3*4*5, 9)
+            nn.init.zeros_(self.residual_pose.weight)
+            with torch.no_grad():
+                self.residual_pose.bias.copy_(torch.tensor([1., 0., 0., 0., 1., 0., 0., 0., 0.]))
 
     def forward(self, tokens, camera_points, T0, rendered, K, height, width):
         camera_patch = F.adaptive_avg_pool2d(camera_points.permute(2, 0, 1)[None], (height, width))[0].permute(1, 2, 0).reshape(-1, 3)
@@ -104,4 +113,8 @@ class SpatialRefinement(nn.Module):
         inputs = torch.cat((self.token_project(tokens), geometry), -1).T.reshape(1, 46, height, width)
         spatial = F.adaptive_avg_pool2d(self.spatial(inputs), (4, 5)).flatten()
         delta = self.pose(spatial)
+        if self.residual_pose is not None:
+            residual_grid = (residual_local/.1).T.reshape(1, 3, height, width)
+            value = self.residual_pose(F.adaptive_avg_pool2d(residual_grid, (4, 5)).flatten())
+            delta = delta @ pose_from_vector(value)
         return fixed @ delta, X_T0.reshape(height, width, 3), residual_world.reshape(height, width, 3)

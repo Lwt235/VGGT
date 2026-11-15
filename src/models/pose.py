@@ -23,7 +23,11 @@ class PoseHead(nn.Module):
 
     def forward(self, pooled):
         value = self.net(pooled)
-        rotation = rotation_6d(value[..., :6])
-        top = torch.cat((rotation, value[..., 6:, None]), -1)
-        bottom = value.new_tensor([0., 0., 0., 1.]).expand(*value.shape[:-1], 1, 4)
-        return torch.cat((top, bottom), -2)
+        return pose_from_vector(value)
+
+
+def pose_from_vector(value):
+    rotation = rotation_6d(value[..., :6])
+    top = torch.cat((rotation, value[..., 6:, None]), -1)
+    bottom = value.new_tensor([0., 0., 0., 1.]).expand(*value.shape[:-1], 1, 4)
+    return torch.cat((top, bottom), -2)
