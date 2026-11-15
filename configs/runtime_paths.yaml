@@ -1,0 +1,77 @@
+schema_version: 1
+project_root: /home/liwt/VGGT
+old_repository:
+  path: /home/liwt/GRoPE
+  policy: read_only_assets_only
+  infrastructure_inventory: closed_2026_11_15
+  experiment_code_or_reports_read: false
+  history_imported: false
+  processes_terminated: []
+python:
+  executable: /home/liwt/anaconda3/bin/python
+  path_found: true
+  import_verified: [torch, numpy, pytest, yaml, PIL, matplotlib]
+  python_version: '3.11'
+  torch_version: 2.6.0+cu124
+  torch_cuda_build: '12.4'
+  system_glibc: '2.27'
+  gpu_matmul_verified: false  # updated only after actual host GPU probe
+  gsplat_import_verified: false
+  gsplat_gpu_render_verified: false
+  missing_imports: [gsplat, safetensors, huggingface_hub, einops]
+assets:
+  vggt_weights:
+    path: null
+    status: not_found_in_bounded_inventory
+    load_verified: false
+  dinov2_weights:
+    path: null
+    status: not_found_in_bounded_inventory
+    load_verified: false
+  official_vggt_source:
+    path: /home/liwt/GRoPE/third_party/vggt
+    pinned_commit_file_value: a288dd0f14786c93483e45524328726ab7b1b4ce
+    status: found_source_only
+    import_verified: false
+    write_allowed: false
+    note: Official third-party source only; not old project business code. No runtime download.
+datasets:
+  sun3d:
+    roots:
+      - /home/liwt/GRoPE/data/round5_sun3d
+      - /home/liwt/GRoPE/data/round6_sun3d
+      - /home/liwt/GRoPE/data/round7_sun3d
+    write_allowed: false
+    status: rgb_depth_intrinsics_extrinsics_found
+    units: meters_after_uint16_rotate_and_divide_1000
+    depth_encoding: uint16_rotate_right_3_bits
+    depth_definition: camera_z_not_euclidean_ray_length
+    native_pose_convention: camera_to_world
+    pose_convention_status: pending_official_loader_and_multiview_check
+    pixel_convention: OpenCV_integer_centers
+    train_scenes:
+      - /home/liwt/GRoPE/data/round5_sun3d/harvard_c5/hv_c5_1
+      - /home/liwt/GRoPE/data/round6_sun3d/brown_bm_1/brown_bm_1
+      - /home/liwt/GRoPE/data/round5_sun3d/harvard_c6/hv_c6_1
+    val_scene: null  # select a disjoint verified scene before main training
+    sample_load_verified: false
+  scannet:
+    path: null
+    status: not_found_in_bounded_inventory
+conventions:
+  quaternion: WXYZ
+  axes: OpenCV_x_right_y_down_z_forward
+  vggt_extrinsics: world_to_camera_3x4
+  gsplat_viewmats: world_to_camera_4x4
+  world_gauge: first_mapping_camera_frame_in_meters
+  query_gt_pose_input: forbidden
+  patch_size: 14
+  gsplat_pixel_centers: half_integer
+  patch_intrinsics: K_edge_patch=diag(1/14,1/14,1)@K_edge_image; K_edge=translate(0.5,0.5)@K_OpenCV
+storage:
+  asset_policy: open_read_only_no_symlinks_needed
+  bytecode_writes: disabled
+  cache_root: /home/liwt/VGGT/.cache
+  torch_extensions: /home/liwt/VGGT/.cache/torch_extensions
+  outputs: /home/liwt/VGGT/results
+  preprocessing: /home/liwt/VGGT/.cache/preprocessed
