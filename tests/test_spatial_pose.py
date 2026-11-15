@@ -5,7 +5,7 @@ from src.data import QueryInput, Supervision
 from src.geometry import transform_points
 from src.losses.world import rotation_geodesic
 from src.memory.gaussians import GaussianMemory
-from src.models.spatial_pose import LegacySpatialBootstrap, SpatialBootstrap, SpatialRefinement, anchor_vote_weights, whitened_irls_pose
+from src.models.spatial_pose import LegacySpatialBootstrap, SpatialBootstrap, SpatialRefinement, anchor_vote_weights, point_irls_pose, whitened_irls_pose
 from src.readout.render import RenderReader, RenderedMemory
 
 
@@ -144,20 +144,20 @@ def test_whitened_two_sided_pose_is_subset_invariant_and_gauge_equivariant():
     G = sample_world_gauge('cpu')
     X = transform_points(P, G)
     vote = torch.rand(h*w)+.2
-    full, _ = whitened_irls_pose(P, X, vote)
+    full, _ = point_irls_pose(P, X, vote)
     # Right-side local removal changes both centroids and camera covariance.
     keep = torch.arange(h*w).reshape(h, w).remainder(w).flatten() < 3*w//4
-    partial, _ = whitened_irls_pose(P[keep], X[keep], vote[keep])
+    partial, _ = point_irls_pose(P[keep], X[keep], vote[keep])
     torch.testing.assert_close(full, G, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(partial, full, atol=2e-5, rtol=2e-5)
     H = sample_world_gauge('cpu')
-    transported, _ = whitened_irls_pose(P[keep], transform_points(X[keep], H), vote[keep])
+    transported, _ = point_irls_pose(P[keep], transform_points(X[keep], H), vote[keep])
     torch.testing.assert_close(transported, H@partial, atol=3e-5, rtol=3e-5)
     # A few low-quality, grossly wrong correspondences must be suppressed.
     bad = X.clone(); bad[[2, 15, 33]] += torch.tensor([2., -2., 3.])
     vote[[2, 15, 33]] = .1
-    robust, _ = whitened_irls_pose(P, bad, vote)
-    robust_subset, _ = whitened_irls_pose(P[keep], bad[keep], vote[keep])
+    robust, _ = point_irls_pose(P, bad, vote)
+    robust_subset, _ = point_irls_pose(P[keep], bad[keep], vote[keep])
     from src.losses.world import pose_errors
     for T in (robust, robust_subset):
         r, t = pose_errors(T, G)
@@ -200,11 +200,11 @@ def test_whitened_pose_gradients_and_empty_low_match_safety():
     P = torch.randn(40, 3, requires_grad=True)
     X = (P.detach()+torch.randn(40, 3)*.02).requires_grad_()
     weights = torch.ones(40, requires_grad=True)
-    T, _ = whitened_irls_pose(P, X, weights)
+    T, _ = point_irls_pose(P, X, weights)
     (T[:3, 3]-.1).square().sum().backward()
     for x in (P, X, weights):
         assert torch.isfinite(x.grad).all() and x.grad.abs().sum() > 0
-    degenerate, _ = whitened_irls_pose(P.detach(), torch.ones_like(X), weights.detach())
+    degenerate, _ = point_irls_pose(P.detach(), torch.ones_like(X), weights.detach())
     torch.testing.assert_close(degenerate[:3, :3].T@degenerate[:3, :3], torch.eye(3), atol=1e-6, rtol=1e-6)
     model = SpatialBootstrap(16, 8)
     empty = GaussianMemory(torch.zeros(0, 3), torch.zeros(0, 3, 3), torch.zeros(0), torch.zeros(0, 8))
@@ -217,3 +217,119 @@ def test_whitened_pose_gradients_and_empty_low_match_safety():
     T, _ = model(tokens, torch.randn(6, 8), memory, torch.eye(3), 2, 3, shallow=tokens)
     assert torch.isfinite(T).all()
     torch.testing.assert_close(T, torch.eye(4), atol=1e-6, rtol=1e-6)
+
+
+def test_ray_bundle_irls_biased_depth_outliers_subset_and_gauge():
+    from src.geometry import world_rays
+    from src.losses.world import pose_errors
+    torch.manual_seed(17)
+    h, w = 8, 10
+    K = torch.tensor([[8., 0., 5.], [0., 8., 4.], [0., 0., 1.]])
+    _, rays, dz = world_rays(K, torch.eye(4), h, w)
+    camera = rays/dz[:, None]*(2+torch.rand(h*w, 1)*2)
+    biased = camera+rays*(.3+.08*torch.sin(torch.arange(h*w).float()))[:, None]
+    G = sample_world_gauge('cpu')
+    anchors = transform_points(camera, G)
+    anchors[[2, 15, 33]] += torch.tensor([.3, -.3, 0.]) @ G[:3, :3].T
+    weights = torch.ones(h*w)
+    full, _ = whitened_irls_pose(biased, rays, anchors, weights)
+    keep = torch.arange(h*w).remainder(w) < 3*w//4
+    partial, _ = whitened_irls_pose(biased[keep], rays[keep], anchors[keep], weights[keep])
+    for T in (full, partial):
+        rotation, translation = pose_errors(T, G)
+        assert rotation < .5 and translation < .025
+    rotation, translation = pose_errors(partial, full)
+    assert rotation < .5 and translation < .025
+    H = sample_world_gauge('cpu')
+    moved, _ = whitened_irls_pose(biased[keep], rays[keep], transform_points(anchors[keep], H), weights[keep])
+    torch.testing.assert_close(moved, H@partial, atol=3e-5, rtol=3e-5)
+    # Gradients traverse the robust weights, depth projections and linear solves.
+    P = biased.requires_grad_()
+    X = anchors.requires_grad_()
+    votes = weights.requires_grad_()
+    T, _ = whitened_irls_pose(P, rays, X, votes)
+    (T[:3, 3]-G[:3, 3]+.05).square().sum().backward()
+    for tensor in (P, X, votes):
+        assert torch.isfinite(tensor.grad).all() and tensor.grad.abs().sum() > 0
+
+
+def test_v2k_spatial_geometry_adaptive_dustbin_and_gauge_independence():
+    from src.geometry import world_rays
+    torch.manual_seed(17)
+    model = SpatialBootstrap(16, 8, ray_bundle=True).eval()
+    tokens, shallow, features = torch.randn(20, 16), torch.randn(20, 16), torch.randn(20, 8)
+    K = torch.tensor([[5., 0., 2.5], [0., 5., 2.], [0., 0., 1.]])
+    # Zero-tail residual starts preserve the compatible per-patch depth head.
+    assert (model.dustbin_head(torch.cat((tokens, shallow), -1)) == 0).all()
+    with torch.no_grad():
+        model.camera_context[-1].weight.normal_(std=.01)
+        model.dustbin_head[-1].weight.normal_(std=.01)
+    points = model.camera_observation(tokens, shallow, K, 4, 5)[0]
+    changed_tokens = tokens.clone(); changed_tokens[7] += 1.
+    changed = model.camera_observation(changed_tokens, shallow, K, 4, 5)[0]
+    assert (changed[6]-points[6]).abs().sum() > 0  # Neighboring patch context.
+    memory = GaussianMemory(torch.randn(30, 3), torch.eye(3).repeat(30, 1, 1)*.01,
+                            torch.ones(30)*.5, torch.randn(30, 8))
+    T, full = model(tokens, features, memory, K, 4, 5, shallow=shallow)
+    G = sample_world_gauge('cpu')
+    moved_memory = GaussianMemory(transform_points(memory.means, G), G[:3, :3]@memory.covars@G[:3, :3].T,
+                                  memory.alpha, memory.features)
+    TG, moved = model(tokens, features, moved_memory, K, 4, 5, shallow=shallow)
+    torch.testing.assert_close(full['camera_patch_points'], moved['camera_patch_points'], atol=0, rtol=0)
+    torch.testing.assert_close(full['dustbin_probability'], moved['dustbin_probability'], atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(TG, G@T, atol=3e-4, rtol=3e-4)
+    empty = memory.subset(slice(0, 0))
+    TE, _ = model(tokens, features, empty, K, 4, 5, shallow=shallow)
+    torch.testing.assert_close(TE, torch.eye(4))
+    with torch.no_grad():
+        model.dustbin_logit.fill_(100.)
+    rejected, _ = model(tokens, features, memory, K, 4, 5, shallow=shallow)
+    assert torch.isfinite(rejected).all()
+    torch.testing.assert_close(rejected, torch.eye(4), atol=1e-6, rtol=1e-6)
+
+
+def test_v2k_refinement_receives_raw_native_points_before_local_depth_anchor(monkeypatch):
+    from types import SimpleNamespace
+    from torch import nn
+    import src.models.vggt_memory as adapter
+    raw = torch.randn(28, 42, 3, requires_grad=True)
+    rendered = RenderedMemory(torch.zeros(2, 3, 3), torch.zeros(2, 3, 8), torch.ones(2, 3, 1),
+                              torch.zeros(2, 3, 1), torch.ones(2, 3, 1))
+    class NativeHead(nn.Module):
+        def forward(self, *args, **kwargs):
+            return raw[None, None], None
+    class Bootstrap(nn.Module):
+        def forward(self, *args, **kwargs):
+            return torch.eye(4), {}
+    class Render(nn.Module):
+        def forward(self, tokens, *args):
+            return tokens, rendered
+        def anchor_camera_geometry(self, points, *args):
+            return points+1, torch.ones(2, 3, 1)
+    class PE(nn.Module):
+        def forward(self, tokens, *args, **kwargs):
+            return tokens, {'attention': None}
+    class Refinement(nn.Module):
+        def forward(self, tokens, points, *args):
+            assert points.data_ptr() == raw.data_ptr()
+            torch.testing.assert_close(points, raw, atol=0, rtol=0)
+            return torch.eye(4), torch.zeros(2, 3, 3), torch.zeros(2, 3, 3)
+    model = adapter.VGGTSpatialMemory.__new__(adapter.VGGTSpatialMemory)
+    nn.Module.__init__(model)
+    model.revision, model.receive_layer = 'v2k', 4
+    model.native = nn.Module()
+    model.native.aggregator = SimpleNamespace()
+    model.native.point_head = NativeHead()
+    model.writer = nn.Module(); model.writer.latent = nn.Identity()
+    model.initial_pose, model.render_reader, model.pe_reader, model.refine_pose = Bootstrap(), Render(), PE(), Refinement()
+    monkeypatch.setattr(adapter, 'frozen_patch_tokens', lambda *args: torch.zeros(1, 6, 16))
+    def aggregate(aggregator, rgb, shallow, receive, layer):
+        tokens = receive(shallow[0])
+        return [torch.cat((tokens, tokens), -1)[None, None]], 0
+    monkeypatch.setattr(adapter, 'aggregate_single', aggregate)
+    query = QueryInput(torch.rand(3, 28, 42), torch.eye(3))
+    memory = GaussianMemory(torch.zeros(0, 3), torch.zeros(0, 3, 3), torch.zeros(0), torch.zeros(0, 8))
+    prediction = model(query, memory)
+    assert prediction['raw_camera_points'].data_ptr() == raw.data_ptr()
+    torch.testing.assert_close(prediction['camera_points'], raw+1)
+    torch.testing.assert_close(prediction['world_points'], raw+1)

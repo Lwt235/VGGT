@@ -1,0 +1,48 @@
+seed: 17
+architecture_revision: v2k
+steps: 1200
+image_hw:
+- 112
+- 140
+receive_layer: 4
+mapping_indices:
+- 0
+- 2
+- 4
+query_indices:
+- 1
+- 3
+- 5
+heldout_query_indices:
+- 6
+optimizer:
+  heads_lr: 5.0e-05
+  pose_lr: 0.0001
+  bootstrap_lr: 0.0003
+  dustbin_lr: 0.01
+  gate_lr: 0.0005
+  refinement_geometry_lr: 0.0002
+  native_lr: 3.0e-06
+  warmup_steps: 40
+  end_lr_ratio: 0.1
+  grad_clip: 5.0
+  dustbin_head_lr: 0.001
+initialize_from: results/smoke_seed17_v2j/trainable.pt
+camera_alignment_weight: 2.0
+patch_depth_weight: 2.0
+anchor_alignment_weight: 1.0
+matching_weight: 1.0
+mapping_self_observation: true
+refinement_safety_weight: 2.0
+bootstrap_key_dropout: none
+world_augmentation: uniform_SO3_translation_plus_minus_3m
+pose_jitter_probability: 0.0
+paired_pose_consistency: true
+log_every: 20
+checkpoint_every: 300
+description: Ray-bundle bootstrap with lateral robust weights, query-adaptive dustbin
+  and balanced support labels; T1 reads raw native camera points. Full system, fixed
+  splits, single seed.
+paired_erasure_radius_m:
+- 0.6
+- 0.75

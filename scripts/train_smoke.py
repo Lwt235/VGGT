@@ -124,7 +124,7 @@ def main():
         del previous
     samples = load_scene_samples(config, "cuda")
     residual_params = list(model.refine_pose.residual_pose.parameters()) if model.refine_pose.residual_pose is not None else []
-    bootstrap_params = list(model.initial_pose.parameters()) if config.get('architecture_revision') == 'v2j' else []
+    bootstrap_params = list(model.initial_pose.parameters()) if config.get('architecture_revision') in ('v2j', 'v2k') else []
     pose_params = [p for p in list(model.initial_pose.parameters())+list(model.refine_pose.parameters())
                    if id(p) not in {id(g) for g in residual_params+bootstrap_params}]
     native_params = [p for p in model.native.parameters() if p.requires_grad]
@@ -141,8 +141,12 @@ def main():
         groups.append({'params': residual_params, 'lr': optim_config['refinement_geometry_lr']})
     if bootstrap_params:
         dustbin = [model.initial_pose.dustbin_logit]
-        groups.append({'params': [p for p in bootstrap_params if p is not dustbin[0]], 'lr': optim_config['bootstrap_lr']})
+        dustbin_head = list(model.initial_pose.dustbin_head.parameters()) if hasattr(model.initial_pose, 'dustbin_head') else []
+        excluded = {id(p) for p in dustbin+dustbin_head}
+        groups.append({'params': [p for p in bootstrap_params if id(p) not in excluded], 'lr': optim_config['bootstrap_lr']})
         groups.append({'params': dustbin, 'lr': optim_config['dustbin_lr'], 'weight_decay': 0.})
+        if dustbin_head:
+            groups.append({'params': dustbin_head, 'lr': optim_config['dustbin_head_lr']})
     optimizer = torch.optim.AdamW(groups, weight_decay=.01)
     def lr_multiplier(step):
         warmup = optim_config['warmup_steps']
@@ -191,7 +195,8 @@ def main():
                 index = torch.multinomial(probability+.001, 1)[0]
                 center = memory.means[index].detach()
                 partial_memory = model.build_memory(mapping)
-                partial_memory, erased_mask = partial_memory.erase_box(center-.5, center+.5)
+                radius = random.uniform(*config['paired_erasure_radius_m']) if 'paired_erasure_radius_m' in config else .5
+                partial_memory, erased_mask = partial_memory.erase_box(center-radius, center+radius)
                 if len(partial_memory) >= len(memory)*.5 and erased_mask.any():
                     partial_prediction = model(query, partial_memory)
                     consistency, consistency_metrics = pose_consistency_loss(partial_prediction, teacher, target,

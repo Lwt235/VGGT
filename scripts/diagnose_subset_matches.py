@@ -20,8 +20,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scripts.train_smoke import load_scene_samples
 from src.models.vggt_memory import VGGTSpatialMemory
-from src.models.spatial_pose import anchor_vote_weights, whitened_irls_pose
-from src.geometry import transform_points
+from src.models.spatial_pose import anchor_vote_weights, whitened_irls_pose, point_irls_pose
+from src.geometry import transform_points, world_rays, patch_intrinsics
 from src.losses.world import pose_errors
 
 
@@ -68,31 +68,38 @@ def main():
         difference = world_patch[:, None]-memory.means[None]
         rho2 = torch.einsum('qmi,mij,qmj->qm', difference, torch.linalg.inv(memory.covars), difference)
         rho_min, nearest = rho2.min(-1)
-        lost = (valid_fraction > .25) & (rho_min <= 9.) & erased[nearest]
-        kept = (valid_fraction > .25) & (rho_min <= 9.) & ~erased[nearest]
+        delta_partial = world_patch[:, None]-partial.means[None]
+        partial_rho = torch.einsum('qmi,mij,qmj->qm', delta_partial, torch.linalg.inv(partial.covars), delta_partial).min(-1).values
+        lost_nearest = (valid_fraction > .25) & (rho_min <= 9.) & erased[nearest]
+        lost = lost_nearest & (partial_rho > 9.)
+        kept = (valid_fraction > .25) & (rho_min <= 9.) & (partial_rho <= 9.)
         camera = full['camera_patch_points']
         anchors = full['anchors']
         votes, after_votes = initial_votes(full, memory), initial_votes(after, partial)
-        baseline, _ = whitened_irls_pose(camera, anchors, votes)
+        _, rays, _ = world_rays(patch_intrinsics(query.K), torch.eye(4, device=camera.device), hp, wp)
+        def solve(points, world, weight):
+            return whitened_irls_pose(points, rays, world, weight) if model.revision=='v2k' else point_irls_pose(points, world, weight)
+        baseline, _ = solve(camera, anchors, votes)
         moments = {}
         for label, values, weights in (
             ('votes_changed_only', anchors, after_votes),
             ('anchors_changed_only', after['anchors'], votes),
             ('both_changed', after['anchors'], after_votes)):
-            predicted, _ = whitened_irls_pose(camera, values, weights)
+            predicted, _ = solve(camera, values, weights)
             rot, trans = pose_errors(predicted, baseline)
             moments[label] = dict(rotation_change_deg=float(rot), translation_change_m=float(trans))
         # Exact-correspondence control uses the model's own full pose and its
         # own camera points. It has no GT transform, no effect on normal V5.
         exact = transform_points(camera, baseline)
-        Tfull, _ = whitened_irls_pose(camera, exact, votes)
-        Tpartial, _ = whitened_irls_pose(camera, exact, after_votes*(~lost))
+        Tfull, _ = solve(camera, exact, votes)
+        Tpartial, _ = solve(camera, exact, after_votes*(~lost))
         rot, trans = pose_errors(Tpartial, Tfull)
         residual = (anchors-transform_points(camera, baseline)).norm(dim=-1)
         anchor_change = (after['anchors']-anchors).norm(dim=-1)
         def masked_mean(value, mask):
             return float(value[mask].mean()) if mask.any() else None
         report[scene['name']] = dict(
+            original_nearest_erased_patches=int(lost_nearest.sum()),
             lost_supported_patches=int(lost.sum()), kept_supported_patches=int(kept.sum()),
             lost_patch_dustbin_before=masked_mean(full['dustbin_probability'], lost),
             lost_patch_dustbin_after=masked_mean(after['dustbin_probability'], lost),

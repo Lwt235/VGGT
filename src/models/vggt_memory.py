@@ -89,7 +89,7 @@ class VGGTSpatialMemory(nn.Module):
         self.native.point_head.requires_grad_(True)
         self.native.aggregator.global_blocks[receive_layer].requires_grad_(True)
         self.receive_layer = receive_layer
-        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h', 'v2i', 'v2j'):
+        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h', 'v2i', 'v2j', 'v2k'):
             raise ValueError('Unknown model revision')
         self.revision = revision
         self.pose_jitter_probability = pose_jitter_probability
@@ -97,8 +97,8 @@ class VGGTSpatialMemory(nn.Module):
         self.fusion = SpatialMomentFusion()
         self.render_reader = RenderReader(metric_depth=revision!='v2')
         self.pe_reader = ParameterPEReader(opacity_occlusion=revision!='v2')
-        self.initial_pose = SpatialBootstrap() if revision=='v2j' else LegacySpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
-        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i', 'v2j'), residual_only=revision in ('v2i', 'v2j'))
+        self.initial_pose = SpatialBootstrap(ray_bundle=revision=='v2k') if revision in ('v2j', 'v2k') else LegacySpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
+        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i', 'v2j', 'v2k'), residual_only=revision in ('v2i', 'v2j', 'v2k'))
 
     def train(self, mode=True):
         super().train(mode)
@@ -124,7 +124,7 @@ class VGGTSpatialMemory(nn.Module):
                                   for key in ("means", "covars", "alpha", "features")))
         # No image/token fields leave this function. Autograd retains only what
         # the current training step requires, never a subsequent query bypass.
-        reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i', 'v2j') else None
+        reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i', 'v2j', 'v2k') else None
         return self.fusion(memory, reference_c2w=reference)
 
     def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False):
@@ -135,11 +135,11 @@ class VGGTSpatialMemory(nn.Module):
         hp, wp = height//14, width//14
         shallow = frozen_patch_tokens(self.native.aggregator, rgb)
         Kp = patch_intrinsics(K)
-        if self.revision == 'v2j':
+        if self.revision in ('v2j', 'v2k'):
             T0, diagnostic = None, {}
         else:
             T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
-        if self.training and self.revision not in ('v2', 'v2j') and torch.rand((), device=rgb.device) < self.pose_jitter_probability:
+        if self.training and self.revision not in ('v2', 'v2j', 'v2k') and torch.rand((), device=rgb.device) < self.pose_jitter_probability:
             # Predicted-pose denoising: stochastic small *local* perturbations,
             # independent of GT, teach the residual head a stationary signal.
             from src.geometry import quat_wxyz_to_matrix
@@ -150,7 +150,7 @@ class VGGTSpatialMemory(nn.Module):
         def receive(tokens):
             nonlocal T0
             with torch.autocast(device_type=rgb.device.type, enabled=False):
-                if self.revision == 'v2j':
+                if self.revision in ('v2j', 'v2k'):
                     T0, bootstrap = self.initial_pose(tokens.float(), self.writer.latent(shallow[0].float()),
                                                      memory, Kp, hp, wp, shallow=shallow[0].float())
                     diagnostic.update(bootstrap)
@@ -169,14 +169,17 @@ class VGGTSpatialMemory(nn.Module):
             dpt_outputs = [None if value is None else value.float() for value in outputs]
             camera_points, _ = self.native.point_head(dpt_outputs, images=rgb[None, None], patch_start_idx=start)
             camera_points = camera_points[0, 0]
+            raw_camera_points = camera_points
             local_confidence = camera_points.new_zeros(hp, wp, 1)
             if self.revision != 'v2':
                 camera_points, local_confidence = self.render_reader.anchor_camera_geometry(camera_points, diagnostic['rendered'], K)
             final = outputs[-1][0, 0, start:].float()
-            T1, X_T0, residual = self.refine_pose(final, camera_points, T0, diagnostic['rendered'], Kp, hp, wp)
+            T1, X_T0, residual = self.refine_pose(final, raw_camera_points if self.revision=='v2k' else camera_points,
+                                                T0, diagnostic['rendered'], Kp, hp, wp)
             points = transform_points(camera_points, T1)
             coarse_points = transform_points(camera_points, T0)
-        return {"world_points": points, "coarse_world_points": coarse_points, "camera_points": camera_points,
+        raw_geometry = {'raw_camera_points': raw_camera_points} if self.revision=='v2k' else {}
+        return {"world_points": points, "coarse_world_points": coarse_points, "camera_points": camera_points, **raw_geometry,
                 "X_T0_patch": X_T0, "alignment_residual": residual, "T0": T0, "T1": T1,
                 "anchor_support_means": memory.means, "anchor_support_covars": memory.covars,
                 "local_geometry_confidence": local_confidence, **diagnostic}

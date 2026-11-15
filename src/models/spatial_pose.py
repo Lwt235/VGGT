@@ -103,7 +103,7 @@ class LegacySpatialBootstrap(nn.Module):
         return T, dict(anchors=anchors, confidence=confidence, bootstrap_attention=weights, bootstrap_support=support, anchor_votes=votes)
 
 
-def whitened_irls_pose(camera_points, anchors, weights, *, tau=.25, damping=1e-6, iterations=2):
+def point_irls_pose(camera_points, anchors, weights, *, tau=.25, damping=1e-6, iterations=2):
     """Two-ended centered right-whitened moments, followed by two IRLS updates.
 
     This is part of the differentiable prediction, never post-prediction fitting.
@@ -138,10 +138,59 @@ def whitened_irls_pose(camera_points, anchors, weights, *, tau=.25, damping=1e-6
     return T.to(original_dtype), robust.to(original_dtype)
 
 
+def whitened_irls_pose(camera_points, rays, anchors, weights, *, tau_perp=.08,
+                        tau_parallel=.40, translation_damping=.02, iterations=3):
+    """Differentiable lateral-ray IRLS and equivariant ray-bundle intersection.
+
+    Predicted radial depth initializes the centered moments and supplies only
+    a broad consistency prior. Tight robust weights use lateral ray distance.
+    All solves are internal forward operations, with no query supervision.
+    """
+    dtype = anchors.dtype
+    points, rays, anchors, weights = [value.double() for value in (camera_points, rays, anchors, weights)]
+    rays = F.normalize(rays, dim=-1)
+    initial, _ = point_irls_pose(points, anchors, weights, iterations=0)
+    R, t = initial[:3, :3], initial[:3, 3]
+    eye = torch.eye(3, device=anchors.device, dtype=anchors.dtype)
+    radial_prior = points.norm(dim=-1)
+    corrected = points
+    robust = weights
+
+    def intersect(rotation, votes, prior_points):
+        direction = rays @ rotation.T
+        projector = eye-direction[:, :, None]*direction[:, None, :]
+        normalized = votes/votes.sum().clamp_min(1e-8)
+        Xbar = (normalized[:, None]*anchors).sum(0)
+        Pbar = (normalized[:, None]*prior_points).sum(0)
+        prior_center = Xbar-rotation @ Pbar
+        # Unnormalized votes keep the fixed .02 regularizer small relative to
+        # a supported bundle. The transported center prior preserves SE(3).
+        A = (votes[:, None, None]*projector).sum(0)+translation_damping*eye
+        b = (votes[:, None]*torch.einsum('qij,qj->qi', projector, anchors)).sum(0)
+        return torch.linalg.solve(A, b+translation_damping*prior_center)
+
+    for _ in range(iterations):
+        direction = rays @ R.T
+        delta = anchors-t
+        radial = (delta*direction).sum(-1)
+        lateral = delta-radial[:, None]*direction
+        robust = weights*(tau_perp**2/(tau_perp**2+lateral.square().sum(-1))).square()
+        robust = robust*tau_parallel**2/(tau_parallel**2+(radial-radial_prior).square())
+        t = intersect(R, robust, corrected)
+        positive_depth = ((anchors-t)*direction).sum(-1).clamp_min(.05)
+        corrected = rays*positive_depth[:, None]
+        updated, _ = point_irls_pose(corrected, anchors, robust, iterations=0)
+        R = updated[:3, :3]
+        t = intersect(R, robust, corrected)
+    T = torch.cat((torch.cat((R, t[:, None]), -1), anchors.new_tensor([[0., 0., 0., 1.]])), 0)
+    return T.to(dtype), robust.to(dtype)
+
+
 class SpatialBootstrap(nn.Module):
     """Memory-independent camera geometry, open-set matches, invariant moments."""
-    def __init__(self, token_dim=1024, latent_dim=256):
+    def __init__(self, token_dim=1024, latent_dim=256, *, ray_bundle=False):
         super().__init__()
+        self.ray_bundle = ray_bundle
         self.key_dropout_mode = 'none'
         self.query_residual = nn.Linear(token_dim+3, latent_dim)
         self.key_residual = nn.Linear(latent_dim+4, latent_dim)
@@ -155,11 +204,28 @@ class SpatialBootstrap(nn.Module):
         nn.init.zeros_(self.camera_geometry[-1].weight)
         with torch.no_grad():
             self.camera_geometry[-1].bias.copy_(torch.tensor([2.4, 1.5]))
+        if ray_bundle:
+            # Residual context preserves a compatible v2j camera-depth start.
+            # Two focal channels are normalized to patch-grid dimensions.
+            self.camera_context = nn.Sequential(nn.Conv2d(258, 64, 3, padding=1), nn.GELU(),
+                                                 nn.Conv2d(64, 2, 3, padding=1))
+            self.dustbin_head = nn.Sequential(nn.LayerNorm(2*token_dim), nn.Linear(2*token_dim, 64),
+                                               nn.GELU(), nn.Linear(64, 1))
+            for layer in (self.camera_context[-1], self.dustbin_head[-1]):
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
 
     def camera_observation(self, tokens_pre_inject, shallow, K, height, width):
         eye = torch.eye(4, device=K.device, dtype=K.dtype)
         _, rays, dz = world_rays(K, eye, height, width)
-        raw = self.camera_geometry(torch.cat((tokens_pre_inject, shallow, rays), -1))
+        inputs = torch.cat((tokens_pre_inject, shallow, rays), -1)
+        hidden = self.camera_geometry[:3](inputs)
+        raw = self.camera_geometry[3](hidden)
+        if self.ray_bundle:
+            focal = torch.stack((K[0, 0]/width, K[1, 1]/height)).clamp_min(1e-6).log()
+            spatial = hidden.T.reshape(1, 256, height, width)
+            context = torch.cat((spatial, focal[None, :, None, None].expand(1, 2, height, width)), 1)
+            raw = raw+self.camera_context(context)[0].permute(1, 2, 0).reshape(-1, 2)
         z = F.softplus(raw[:, 0])+.05
         confidence = raw[:, 1].sigmoid()
         return rays/dz[:, None]*z[:, None], z, confidence, rays
@@ -183,13 +249,16 @@ class SpatialBootstrap(nn.Module):
         q = F.normalize(query_features+self.query_residual(torch.cat((shallow, rays), -1)), dim=-1)
         k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
         logits = q @ k.T*self.log_temperature.exp().clamp(max=60.)+memory.alpha.clamp_min(1e-6).log()[None]
-        W = torch.cat((logits, self.dustbin_logit.expand(count, 1)), -1).softmax(-1)
+        dustbin = self.dustbin_logit.expand(count, 1)
+        if self.ray_bundle:
+            dustbin = dustbin+self.dustbin_head(torch.cat((tokens_pre_inject, shallow), -1))
+        W = torch.cat((logits, dustbin), -1).softmax(-1)
         p_match = 1-W[:, -1]
         inlier = W[:, :-1]/p_match[:, None].clamp_min(1e-6)
         anchors = inlier @ memory.means
         entropy_confidence = 1+(inlier*inlier.clamp_min(1e-9).log()).sum(-1)/math.log(max(2, len(memory)))
         weights = p_match*c_depth*anchor_vote_weights(inlier, memory, anchors, entropy_confidence)
-        T, votes = whitened_irls_pose(points, anchors, weights)
+        T, votes = whitened_irls_pose(points, rays, anchors, weights) if self.ray_bundle else point_irls_pose(points, anchors, weights)
         # On observable matches this is exactly one in floating point. Identity
         # fallback in the unobservable regime is intentionally not gauge equivariant.
         quality = ((p_match.sum()-.25)/.025).sigmoid()

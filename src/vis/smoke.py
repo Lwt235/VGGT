@@ -404,7 +404,7 @@ def deliver_visualizations(model, samples, output_dir, records, *, camera_weight
         print("Visualizations generated:", scene_folder, flush=True)
     plot_training_curves(output_dir, records)
     (output_dir/"evaluation.json").write_text(json.dumps(all_metrics, indent=2)+"\n")
-    if model.revision == 'v2j':
+    if model.revision in ('v2j', 'v2k'):
         grouped = {'covisible_queries': [], 'low_overlap_blind_queries': []}
         for scene in samples:
             metrics = all_metrics[scene['name']]

@@ -52,7 +52,7 @@ def _legacy_world_loss(output, target, *, camera_weight=.5, refinement_safety_we
             match = -(teacher[anchor_mask]*output['bootstrap_attention'][anchor_mask].clamp_min(1e-9).log()).sum(-1).mean()/max(1., math.log(len(output['anchor_support_means'])))
     anchor = (output['anchors'][anchor_mask]-world_patch.reshape(-1, 3)[anchor_mask]).abs().mean() if anchor_mask.any() else point*0.
     camera_truth = transform_points(target.world_points, invert_se3(target.c2w))
-    camera_alignment = (output['camera_points'][valid]-camera_truth[valid]).abs().mean()
+    camera_alignment = (output.get('raw_camera_points', output['camera_points'])[valid]-camera_truth[valid]).abs().mean()
     # Training supervision only: the reference is detached, so this cannot
     # reward making T0 worse. Inference always returns the predicted T1.
     r0_angle = rotation_geodesic(coarse[:3, :3], target.c2w[:3, :3])
@@ -109,7 +109,7 @@ def open_set_matching_loss(output, target, erased_reference=None):
             delta = world.reshape(-1, 3)[:, None]-original_means.detach()[None]
             original_rho2 = torch.einsum('qmi,mij,qmj->qm', delta, torch.linalg.inv(original_covars.detach()), delta)
             nearest_rho, nearest = original_rho2.min(-1)
-            removed = patch_valid & (nearest_rho <= 9) & erased[nearest]
+            removed = patch_valid & (nearest_rho <= 9) & erased[nearest] & (minimum > 9)
             positive &= ~removed
             negative |= removed
         if not observable:
@@ -121,8 +121,10 @@ def open_set_matching_loss(output, target, erased_reference=None):
         terms[positive] = -(teacher[positive]*W[positive, :-1].log()).sum(-1)
     if negative.any():
         terms[negative] = -W[negative, -1].log()
-    labeled = positive | negative
-    match = terms[labeled].mean() if labeled.any() else W.sum()*0
+    # Equal class contributions: many supported patches cannot drown the
+    # sparse true-missing negatives. Single-class blind frames remain valid.
+    classes = [terms[mask].mean() for mask in (positive, negative) if mask.any()]
+    match = torch.stack(classes).sum() if classes else W.sum()*0
     anchor = (output['anchors'][positive]-world.reshape(-1, 3)[positive]).abs().mean() if positive.any() else output['anchors'].sum()*0
     return match, anchor, support_rate, observable
 
@@ -143,7 +145,7 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
     z_loss = depth_error.mean()
     confidence_loss = F.binary_cross_entropy(output['c_depth'][mask].clamp(1e-6, 1-1e-6), torch.exp(-depth_error.detach()/.5))
     camera_truth = transform_points(target.world_points, invert_se3(target.c2w))
-    camera_delta = output['camera_points'][target.valid]-camera_truth[target.valid]
+    camera_delta = output.get('raw_camera_points', output['camera_points'])[target.valid]-camera_truth[target.valid]
     # No random-world pose/point/anchor loss on the unobservable frame.
     loss = base+anchor_weight*anchor if observable else camera_weight*camera_delta.abs().mean()
     loss = loss+matching_weight*match+depth_weight*(z_loss+.05*confidence_loss)
@@ -153,4 +155,6 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
                    dustbin_mean=float(output['dustbin_probability'].detach().mean()),
                    dustbin_rejection_rate=float((output['dustbin_probability'].detach() > .5).float().mean()),
                    match_mass=float(output['match_mass'].detach()))
+    if 'raw_camera_points' in output:
+        metrics['anchored_camera_epe_m'] = float((output['camera_points'][target.valid]-camera_truth[target.valid]).detach().norm(dim=-1).mean())
     return loss, metrics
