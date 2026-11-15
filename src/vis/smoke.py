@@ -424,11 +424,13 @@ def gate_statistics(gate):
 
 def plot_training_curves(output_dir, records):
     fig, grid = plt.subplots(2, 3, figsize=(14, 7), layout="constrained")
-    fig.suptitle('Training curves follow the run augmentation config; fixed evaluation has no pose jitter or key dropout', fontsize=10)
+    open_set = 'dustbin_mean' in records[0]
+    fig.suptitle('Observable-query curves (<5% support excluded); blind local geometry/rejection shown separately' if open_set else
+                 'Training curves follow the run augmentation config; fixed evaluation has no pose jitter or key dropout', fontsize=10)
     axes = grid.flatten()
     palette = ["#0072b2", "#d55e00", "#009e73"]
     for index, name in enumerate(dict.fromkeys(record["scene"] for record in records)):
-        data = [r for r in records if r["scene"] == name]
+        data = [r for r in records if r["scene"] == name and r.get('world_supervision_enabled', 1.) > 0]
         for ax, key, title in zip(axes, ["loss", "point_epe_m", "rotation1_deg", "translation1_m"], ["World + pose loss (random training gauge)", "World EPE [m]", "Rotation: dashed T0, solid T1 [deg]", "Translation: dashed T0, solid T1 [m]"]):
             values = np.array([r[key] for r in data])
             steps = np.array([r["step"] for r in data])
@@ -456,3 +458,37 @@ def plot_training_curves(output_dir, records):
     alpha_axes.plot([r['step'] for r in records], [r['alpha_max'] for r in records], color='#d55e00', lw=.6)
     alpha_axes.set(ylabel='alpha min/max (orange)', ylim=(0, 1))
     save(fig, output_dir/"vis/training_curves.png")
+    if open_set:
+        plot_open_set_curves(output_dir, records)
+
+
+def plot_open_set_curves(output_dir, records):
+    fig, grid = plt.subplots(2, 2, figsize=(11, 6), layout='constrained')
+    def curve(ax, data, key, label):
+        if not data:
+            return
+        steps = np.array([r['step'] for r in data])
+        values = np.array([r[key] for r in data])
+        line, = ax.plot(steps, values, alpha=.15)
+        if len(values) >= 10:
+            ax.plot(steps[9:], np.convolve(values, np.ones(10)/10, mode='valid'), color=line.get_color(), label=label)
+        else:
+            line.set_label(label)
+    for name in dict.fromkeys(r['scene'] for r in records):
+        visible = [r for r in records if r['scene'] == name and r['world_supervision_enabled']]
+        blind = [r for r in records if r['scene'] == name and not r['world_supervision_enabled']]
+        curve(grid[0, 0], visible, 'z_cam_l1_m', name)
+        curve(grid[0, 1], blind, 'camera_epe_m', name+' camera EPE')
+        curve(grid[0, 1], blind, 'z_cam_l1_m', name+' patch depth L1')
+        curve(grid[1, 0], visible, 'dustbin_mean', name+' observable')
+        curve(grid[1, 0], blind, 'dustbin_mean', name+' blind')
+        curve(grid[1, 1], visible, 'surface_support_rate', name+' observable')
+        curve(grid[1, 1], blind, 'surface_support_rate', name+' blind')
+    for ax, title in zip(grid.flatten(), ['Pre-injection patch depth L1 [m]', 'Blind-query LOCAL geometry [m]',
+                                         'Mean dustbin probability', 'GT surface support (criterion only)']):
+        ax.set(title=title, xlabel='Total updates')
+        ax.legend(fontsize=7)
+    grid[1, 0].set_ylim(0, 1)
+    grid[1, 1].set_ylim(0, 1)
+    fig.suptitle('All original queries retained; observable world supervision / blind local geometry + rejection')
+    save(fig, output_dir/'vis/open_set_training_curves.png')
