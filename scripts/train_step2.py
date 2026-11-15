@@ -156,6 +156,12 @@ def save_checkpoint(model, optimizer, scheduler, config, folder, step, weights):
     path = folder/'training_state.pt'
     torch.save(checkpoint, folder/'training_state.tmp')
     (folder/'training_state.tmp').replace(path)
+    if step in (config['midpoint_steps'], config['steps']):
+        snapshot = folder/f'training_state_{step:05d}.pt'
+        if not snapshot.exists():
+            # Zero-copy milestone: later atomic latest-checkpoint replacement
+            # preserves this inode, including model/optimizer/RNG at the gate.
+            snapshot.hardlink_to(path)
 
 
 def main():

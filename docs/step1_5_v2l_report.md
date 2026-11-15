@@ -1,5 +1,7 @@
 # Step 1.5 v2l：各向异性马氏椭球LM与T0_read去噪
 
+后续状态（2026-11-16）：用户完整审阅本报告后，正式确认探索期Step1.5通过并结项，授权从官方权重全新开展Step2。以下保留当时按局部增量判据给出的实测与判断，不再据此在旧8张图上续训v2m。最新执行见docs/step2_report.md及master_plan。
+
 本轮1200步复验与诊断已完成，**LM发散及Brown的T0跳变已改善，但Step1.5尚未全部达标**。seed17、固定原splits、新目录results/smoke_seed17_v2l，从本项目v2k兼容权重热启动。Step2未启动。
 
 ## 实现

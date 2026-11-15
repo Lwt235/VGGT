@@ -52,17 +52,41 @@ def curves(folder, train, validation):
     for ax, key, title in zip(axes[1], ('point_epe_m', 'rotation1_deg', 'translation1_m'),
                                ('Unaligned world EPE [m]', 'Rotation error [deg]', 'Translation error [m]')):
         for group in ('cross_scene_val', 'same_scene_heldout'):
+            color = '#0072b2' if group == 'cross_scene_val' else '#d55e00'
             full = [r for r in validation if r['scope']=='full' and r['group']==group]
-            ax.plot([r['step'] for r in full], [r[key] for r in full], 'o-', label=group)
+            ax.plot([r['step'] for r in full], [r[key] for r in full], 'o-', color=color, label=group)
             quick = [r for r in validation if r['scope']=='quick' and r['group']==group]
             if quick:
-                ax.scatter([r['step'] for r in quick], [r[key] for r in quick], marker='x', alpha=.5, label=group+' quick subset')
+                ax.scatter([r['step'] for r in quick], [r[key] for r in quick], marker='x', color=color, alpha=.5, label=group+' quick subset')
             if key in ('rotation1_deg', 'translation1_m'):
-                ax.plot([r['step'] for r in full], [r[key.replace('1_', '0_')] for r in full], '--', alpha=.6)
-        ax.set(title=title+'; dashed=T0, solid=T1', xlabel='Updates'); ax.legend(fontsize=6)
+                ax.plot([r['step'] for r in full], [r[key.replace('1_', '0_')] for r in full], '--', color=color, alpha=.6)
+        ax.set(title=title+('; dashed=T0, solid=T1' if key!='point_epe_m' else ''), xlabel='Updates'); ax.legend(fontsize=6)
     fig.suptitle('Fresh official VGGT / seed17; fixed disjoint validation; evaluation G=I, no read noise')
     save(fig, folder/'training_validation_curves.png')
 
 
 def dump_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False)+'\n')
+
+
+def causal_summary(folder, evaluation):
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7), layout='constrained')
+    conditions = ('full', 'empty_same_weights', 'mismatched_same_weights', 'erased_same_weights')
+    labels = ('Full', 'Empty', 'Mismatch', '3D erased')
+    for row, group in enumerate(('cross_scene_val', 'same_scene_heldout')):
+        rows = [r for r in evaluation['episodes'] if r['split']==group and r['surface_support_rate'] >= .05]
+        values = [np.mean([r['point_epe_m'] if key=='full' else r[key]['point_epe_m'] for r in rows]) for key in conditions]
+        axes[row, 0].bar(labels, values, color=['#0072b2', '#999999', '#cc79a7', '#d55e00'])
+        axes[row, 0].set(title=group+': same weights, no retraining', ylabel='Unaligned world EPE [m]')
+        valid = [r['erasure'] for r in rows if r['erasure']['local_pixels'] and r['erasure']['outside_pixels']]
+        inside = [1000*r['epe_increase_inside_m'] for r in valid]
+        outside = [1000*r['epe_increase_outside_m'] for r in valid]
+        axes[row, 1].scatter(outside, inside, alpha=.65, s=16)
+        if valid:
+            lo, hi = min(0, *inside, *outside), max(1., *inside, *outside)
+            axes[row, 1].plot([lo, hi], [lo, hi], '--', color='grey', lw=.8)
+        axes[row, 1].axhline(0, color='grey', lw=.5); axes[row, 1].axvline(0, color='grey', lw=.5)
+        axes[row, 1].set(title='Every unseen query; above diagonal = stronger local degradation',
+                         xlabel='Outside bbox mean ΔEPE [mm]', ylabel='Inside bbox mean ΔEPE [mm]')
+    fig.suptitle(f"Step {evaluation['step']}: all covisible unseen queries; negative changes are retained")
+    save(fig, folder/'counterfactual_summary.png')
