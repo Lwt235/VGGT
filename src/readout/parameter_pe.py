@@ -41,11 +41,12 @@ def active_memory(memory, query_c2w, K, height, width, *, budget=2048, margin=.2
 
 
 class ParameterPEReader(nn.Module):
-    def __init__(self, token_dim=1024, latent_dim=256, heads=8, bands=8):
+    def __init__(self, token_dim=1024, latent_dim=256, heads=8, bands=8, *, opacity_occlusion=True):
         super().__init__()
         if token_dim % heads:
             raise ValueError("token_dim must divide heads")
         self.heads, self.bands = heads, bands
+        self.opacity_occlusion = opacity_occlusion
         self.query = nn.Linear(token_dim, token_dim)
         self.query_geometry = nn.Linear(6*bands+6, token_dim, bias=False)
         self.key = nn.Linear(latent_dim+6*bands, token_dim)
@@ -84,6 +85,8 @@ class ParameterPEReader(nn.Module):
                                              selected.means, selected.covars)
             closest_z = t*camera_dz[start:stop, None]
             relative_z = closest_z-render_depth.reshape(-1)[start:stop, None]
+            if rendered is not None and self.opacity_occlusion:
+                relative_z = relative_z*rendered.opacity.reshape(-1)[start:stop, None]
             normal_cos = torch.abs(directions[start:stop] @ normals.T)
             shape = log_scales[None].expand(stop-start, -1, -1)
             geometry = torch.cat((torch.log1p(rho2)[..., None], torch.log1p(closest_z)[..., None],

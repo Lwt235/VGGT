@@ -31,7 +31,8 @@ def main():
     checkpoint = load_checkpoint_readonly(run/"trainable.pt")
     runtime = load_config()
     model = VGGTSpatialMemory(runtime["assets"]["official_vggt_source"]["path"],
-                               checkpoint["weight_source"], receive_layer=checkpoint["config"]["receive_layer"]).cuda().eval()
+                               checkpoint["weight_source"], receive_layer=checkpoint["config"]["receive_layer"],
+                               revision=checkpoint['config'].get('architecture_revision', 'v2')).cuda().eval()
     parameters = dict(model.named_parameters())
     expected = {name for name, p in parameters.items() if p.requires_grad}
     if expected != set(checkpoint["trainable"]):

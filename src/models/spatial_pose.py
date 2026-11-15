@@ -13,7 +13,7 @@ from src.models.pose import PoseHead, rotation_6d
 
 
 class SpatialBootstrap(nn.Module):
-    def __init__(self, token_dim=1024, latent_dim=256):
+    def __init__(self, token_dim=1024, latent_dim=256, *, local_rotation=True):
         super().__init__()
         self.query_residual = nn.Linear(token_dim+3, latent_dim)
         self.key_residual = nn.Linear(latent_dim+4, latent_dim)
@@ -30,6 +30,15 @@ class SpatialBootstrap(nn.Module):
         nn.init.constant_(self.translation[-1].bias, 0.)
         with torch.no_grad():
             self.translation[-1].bias[2] = -2.
+        self.local_rotation = None
+        self.geometry_context = None
+        if local_rotation:
+            self.geometry_context = nn.Linear(3*4*5, 64*4*5, bias=False)
+            nn.init.zeros_(self.geometry_context.weight)
+            self.local_rotation = nn.Sequential(nn.Flatten(), nn.Linear(64*4*5, 128), nn.GELU(), nn.Linear(128, 6))
+            nn.init.zeros_(self.local_rotation[-1].weight)
+            with torch.no_grad():
+                self.local_rotation[-1].bias.copy_(torch.tensor([1., 0., 0., 0., 1., 0.]))
 
     def forward(self, tokens, query_features, memory, K, height, width):
         eye = torch.eye(4, device=tokens.device, dtype=tokens.dtype)
@@ -39,7 +48,15 @@ class SpatialBootstrap(nn.Module):
         scales = torch.linalg.eigvalsh(memory.covars).clamp_min(1e-10).sqrt().log()
         q = F.normalize(query_features+self.query_residual(torch.cat((tokens, rays), -1)), dim=-1)
         k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
-        weights = (q @ k.T * self.log_temperature.exp().clamp(max=60.) + memory.alpha.clamp_min(1e-6).log()[None]).softmax(-1)
+        logits = q @ k.T * self.log_temperature.exp().clamp(max=60.) + memory.alpha.clamp_min(1e-6).log()[None]
+        support = torch.ones(len(memory), dtype=torch.bool, device=tokens.device)
+        if self.training and self.local_rotation is not None:
+            # Global localization must tolerate small missing map subsets.
+            # O5/O6 still read the full map; this is bootstrap key dropout.
+            support = torch.rand(len(memory), device=tokens.device) > .1
+            support[0] = True
+            logits = logits.masked_fill(~support[None], float('-inf'))
+        weights = logits.softmax(-1)
         anchors = weights @ memory.means
         confidence = 1.+(weights*weights.clamp_min(1e-9).log()).sum(-1)/math.log(max(2, len(memory)))
         center = anchors.mean(0)
@@ -50,13 +67,19 @@ class SpatialBootstrap(nn.Module):
         # world vectors. Learned corrections can handle oblique/reverse views.
         a = ((rays[:, 0]+coefficients[:, 0])[:, None]*(anchors-center)).sum(0)
         b = ((rays[:, 1]+coefficients[:, 1])[:, None]*(anchors-center)).sum(0)
-        R = rotation_6d(torch.cat((a, b)))
+        anchor_R = rotation_6d(torch.cat((a, b)))
         spatial = features.T.reshape(1, 64, height, width)
-        local_translation = self.translation(F.adaptive_avg_pool2d(spatial, (4, 5)))[0]
+        pooled = F.adaptive_avg_pool2d(spatial, (4, 5))
+        if self.geometry_context is not None:
+            local_anchors = ((anchors-center) @ anchor_R).T.reshape(1, 3, height, width)
+            local_layout = F.adaptive_avg_pool2d(local_anchors, (4, 5)).flatten(1)
+            pooled = pooled+self.geometry_context(local_layout).reshape_as(pooled)
+        local_translation = self.translation(pooled)[0]
+        R = anchor_R if self.local_rotation is None else anchor_R @ rotation_6d(self.local_rotation(pooled)[0])
         centroid_weights = coefficients[:, 2].softmax(0)
-        translation = centroid_weights @ anchors + R @ local_translation
+        translation = centroid_weights @ anchors + anchor_R @ local_translation
         T = torch.cat((torch.cat((R, translation[:, None]), -1), eye[3:]), 0)
-        return T, dict(anchors=anchors, confidence=confidence, bootstrap_attention=weights)
+        return T, dict(anchors=anchors, confidence=confidence, bootstrap_attention=weights, bootstrap_support=support)
 
 
 class SpatialRefinement(nn.Module):

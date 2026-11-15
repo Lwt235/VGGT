@@ -11,7 +11,7 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 import torch
 
-from src.geometry import patch_intrinsics, world_rays
+from src.geometry import patch_intrinsics, world_rays, ray_ellipsoid_distance
 from src.losses.world import world_loss, pose_errors
 
 COLD = "#8c969f"
@@ -340,6 +340,21 @@ def deliver_visualizations(model, samples, output_dir, records):
                              "attention_normalized_entropy_mean": entropy,
                              "attention_entropy_per_head": (-(attention.float().clamp_min(1e-10)*attention.float().clamp_min(1e-10).log()).sum(-1)/np.log(attention.shape[-1])).mean(-1).cpu().tolist() if attention is not None and attention.shape[-1]>1 else None,
                              "o5_gate": gate_statistics(model.render_reader.gate), "o6_gate": gate_statistics(model.pe_reader.gate)}
+        metrics['memory']['local_geometry_confidence_mean'] = float(full['local_geometry_confidence'].mean())
+        if attention is not None:
+            origin, ray, dz = world_rays(patch_intrinsics(query.K), full['T0'], h//14, w//14)
+            selected = memory.subset(full['attention']['indices'])
+            rho2, distance = ray_ellipsoid_distance(origin, ray, selected.means, selected.covars)
+            relative_z = distance*dz[:, None]-full['rendered'].depth.reshape(-1, 1)
+            weights = attention.float().mean(0)
+            neighbor = rho2 <= 9.
+            metrics['memory'].update(attention_mass_in_3sigma=float((weights*neighbor).sum(-1).mean()),
+                uniform_mass_in_3sigma=float(neighbor.float().mean()),
+                attention_log1p_rho2=float((weights*torch.log1p(rho2)).sum(-1).mean()),
+                uniform_log1p_rho2=float(torch.log1p(rho2).mean()),
+                attention_mass_behind_50cm=float((weights*(relative_z>.5)).sum(-1).mean()),
+                gamma_positive=torch.nn.functional.softplus(model.pe_reader.gamma).cpu().tolist(),
+                beta_positive=torch.nn.functional.softplus(model.pe_reader.beta).cpu().tolist())
         metrics["all_training_queries"] = []
         for query_index, (training_query, training_target) in enumerate(scene["queries"]):
             training_prediction = full if query_index == 1 else model(training_query, memory)
@@ -374,16 +389,31 @@ def gate_statistics(gate):
 
 
 def plot_training_curves(output_dir, records):
-    fig, axes = plt.subplots(1, 3, figsize=(13, 3.5), layout="constrained")
+    fig, grid = plt.subplots(2, 3, figsize=(14, 7), layout="constrained")
+    axes = grid.flatten()
     palette = ["#0072b2", "#d55e00", "#009e73"]
     for index, name in enumerate(dict.fromkeys(record["scene"] for record in records)):
         data = [r for r in records if r["scene"] == name]
-        for ax, key, title in zip(axes, ["loss", "point_epe_m", "translation1_m"], ["World + pose loss", "World EPE [m]", "Refined translation [m]"]):
+        for ax, key, title in zip(axes, ["loss", "point_epe_m", "rotation1_deg", "translation1_m"], ["World + pose loss (random training gauge)", "World EPE [m]", "Rotation: dashed T0, solid T1 [deg]", "Translation: dashed T0, solid T1 [m]"]):
             values = np.array([r[key] for r in data])
             steps = np.array([r["step"] for r in data])
             ax.plot(steps, values, alpha=.18, color=palette[index])
             if len(values) >= 10:
                 ax.plot(steps[9:], np.convolve(values, np.ones(10)/10, mode="valid"), label=name, color=palette[index])
             ax.set(xlabel="Total updates", title=title)
+            if key in ('rotation1_deg', 'translation1_m'):
+                coarse_key = key.replace('1_', '0_')
+                coarse = np.array([r[coarse_key] for r in data])
+                if len(coarse) >= 10:
+                    ax.plot(steps[9:], np.convolve(coarse, np.ones(10)/10, mode='valid'), ls='--', color=palette[index], alpha=.7)
     axes[0].legend(fontsize=7)
+    for key, color in [('o5', '#0072b2'), ('o6', '#d55e00')]:
+        axes[4].plot([r['step'] for r in records], [r[key+'_gate'] for r in records], color=color, label=key+' mean |tanh gate|')
+        maxkey = key+'_gate_max_abs'
+        if maxkey in records[0]:
+            axes[4].plot([r['step'] for r in records], [r[maxkey] for r in records], ls='--', color=color, label=key+' max |tanh gate|')
+    axes[4].set(title='Per-channel gate opening', xlabel='Total updates')
+    axes[4].legend(fontsize=7)
+    axes[5].plot([r['step'] for r in records], [r['min_covariance_eigenvalue'] for r in records], lw=.6)
+    axes[5].set(title='Minimum covariance eigenvalue [m²]', xlabel='Total updates', yscale='log')
     save(fig, output_dir/"vis/training_curves.png")

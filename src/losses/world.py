@@ -1,7 +1,9 @@
 """World metric supervision only: no fitting, centering, relative-depth loss."""
 
+import math
 import torch
 from torch.nn import functional as F
+from src.geometry import invert_se3, transform_points
 
 
 def rotation_geodesic(prediction, target):
@@ -27,7 +29,7 @@ def world_loss(output, target):
     point = delta.abs().mean()
     coarse = output["T0"]
     refined = output["T1"]
-    pose = sum((T[:3, 3]-target.c2w[:3, 3]).abs().mean() +
+    pose = sum((T[:3, 3]-target.c2w[:3, 3]).norm() +
                rotation_geodesic(T[:3, :3], target.c2w[:3, :3]) for T in (coarse, refined))
     coarse_point = (output['coarse_world_points'][valid]-target.world_points[valid]).abs().mean()
     # Explicit patch-anchor supervision, evaluator/criterion only. It teaches
@@ -36,13 +38,28 @@ def world_loss(output, target):
     valid_patch = F.adaptive_avg_pool2d(valid.float()[None, None], (hp, wp))[0, 0]
     world_patch = F.adaptive_avg_pool2d((target.world_points*valid[..., None]).permute(2, 0, 1)[None], (hp, wp))[0].permute(1, 2, 0)/valid_patch.clamp_min(1e-6)[..., None]
     anchor_mask = valid_patch.flatten() > .25
-    anchor = (output['anchors'][anchor_mask]-world_patch.reshape(-1, 3)[anchor_mask]).abs().mean()
-    loss = point + .25*coarse_point + .5*pose + .2*anchor
+    match = point*0.
+    if len(output['anchor_support_means']):
+        with torch.no_grad():
+            delta_anchor = world_patch.reshape(-1, 3)[:, None]-output['anchor_support_means'].detach()[None]
+            precision = torch.linalg.inv(output['anchor_support_covars'].detach())
+            rho2 = torch.einsum('qmi,mij,qmj->qm', delta_anchor, precision, delta_anchor)
+            rho2 = rho2.masked_fill(~output['bootstrap_support'][None], float('inf'))
+            anchor_mask = anchor_mask & (rho2.min(-1).values <= 9.)
+            teacher = (-rho2/2.).softmax(-1)
+        if anchor_mask.any():
+            match = -(teacher[anchor_mask]*output['bootstrap_attention'][anchor_mask].clamp_min(1e-9).log()).sum(-1).mean()/max(1., math.log(len(output['anchor_support_means'])))
+    anchor = (output['anchors'][anchor_mask]-world_patch.reshape(-1, 3)[anchor_mask]).abs().mean() if anchor_mask.any() else point*0.
+    camera_truth = transform_points(target.world_points, invert_se3(target.c2w))
+    camera_alignment = (output['camera_points'][valid]-camera_truth[valid]).abs().mean()
+    loss = point + .25*coarse_point + pose + .2*anchor + .2*match + .5*camera_alignment
     with torch.no_grad():
         r0, t0 = pose_errors(coarse, target.c2w)
         r1, t1 = pose_errors(refined, target.c2w)
     return loss, {"loss": loss.detach().item(), "point_l1_m": point.detach().item(),
                   "point_epe_m": delta.detach().norm(dim=-1).mean().item(),
                   "coarse_point_l1_m": coarse_point.detach().item(), "anchor_l1_m": anchor.detach().item(),
+                  "camera_alignment_l1_m": camera_alignment.detach().item(), "correspondence_loss": match.detach().item(),
+                  "coarse_point_epe_m": (output['coarse_world_points'][valid]-target.world_points[valid]).detach().norm(dim=-1).mean().item(),
                   "rotation0_deg": r0.item(), "rotation1_deg": r1.item(),
                   "translation0_m": t0.item(), "translation1_m": t1.item()}

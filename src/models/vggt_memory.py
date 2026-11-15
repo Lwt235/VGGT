@@ -69,7 +69,7 @@ def aggregate_single(aggregator, rgb, patch_tokens, injection=None, receive_laye
 
 
 class VGGTSpatialMemory(nn.Module):
-    def __init__(self, source, weights, *, receive_layer=4):
+    def __init__(self, source, weights, *, receive_layer=4, revision='v2b'):
         super().__init__()
         # No random fallback or automatic download: missing weights stop here.
         if weights is None or not Path(weights).is_file():
@@ -89,11 +89,14 @@ class VGGTSpatialMemory(nn.Module):
         self.native.point_head.requires_grad_(True)
         self.native.aggregator.global_blocks[receive_layer].requires_grad_(True)
         self.receive_layer = receive_layer
+        if revision not in ('v2', 'v2b'):
+            raise ValueError('Unknown model revision')
+        self.revision = revision
         self.writer = TokenGaussianWriter(1024)
         self.fusion = SpatialMomentFusion()
-        self.render_reader = RenderReader()
-        self.pe_reader = ParameterPEReader()
-        self.initial_pose = SpatialBootstrap()
+        self.render_reader = RenderReader(metric_depth=revision=='v2b')
+        self.pe_reader = ParameterPEReader(opacity_occlusion=revision=='v2b')
+        self.initial_pose = SpatialBootstrap(local_rotation=revision=='v2b')
         self.refine_pose = SpatialRefinement()
 
     def train(self, mode=True):
@@ -131,6 +134,14 @@ class VGGTSpatialMemory(nn.Module):
         shallow = frozen_patch_tokens(self.native.aggregator, rgb)
         Kp = patch_intrinsics(K)
         T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
+        if self.training and self.revision == 'v2b':
+            # Predicted-pose denoising: stochastic small *local* perturbations,
+            # independent of GT, teach the residual head a stationary signal.
+            from src.geometry import quat_wxyz_to_matrix
+            jitter = torch.eye(4, device=rgb.device)
+            jitter[:3, :3] = quat_wxyz_to_matrix(torch.cat((rgb.new_ones(1), torch.randn(3, device=rgb.device)*.015)))
+            jitter[:3, 3] = torch.randn(3, device=rgb.device)*.08
+            T0 = T0 @ jitter
         def receive(tokens):
             with torch.autocast(device_type=rgb.device.type, enabled=False):
                 read, rendered = self.render_reader(tokens.float(), memory, T0, Kp, hp, wp)
@@ -148,9 +159,14 @@ class VGGTSpatialMemory(nn.Module):
             dpt_outputs = [None if value is None else value.float() for value in outputs]
             camera_points, _ = self.native.point_head(dpt_outputs, images=rgb[None, None], patch_start_idx=start)
             camera_points = camera_points[0, 0]
+            local_confidence = camera_points.new_zeros(hp, wp, 1)
+            if self.revision == 'v2b':
+                camera_points, local_confidence = self.render_reader.anchor_camera_geometry(camera_points, diagnostic['rendered'], K)
             final = outputs[-1][0, 0, start:].float()
             T1, X_T0, residual = self.refine_pose(final, camera_points, T0, diagnostic['rendered'], Kp, hp, wp)
             points = transform_points(camera_points, T1)
             coarse_points = transform_points(camera_points, T0)
         return {"world_points": points, "coarse_world_points": coarse_points, "camera_points": camera_points,
-                "X_T0_patch": X_T0, "alignment_residual": residual, "T0": T0, "T1": T1, **diagnostic}
+                "X_T0_patch": X_T0, "alignment_residual": residual, "T0": T0, "T1": T1,
+                "anchor_support_means": memory.means, "anchor_support_covars": memory.covars,
+                "local_geometry_confidence": local_confidence, **diagnostic}

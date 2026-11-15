@@ -39,7 +39,7 @@ def test_random_world_gauge_changes_only_supervision_and_transports_bootstrap():
                             torch.full((30,), .5), torch.randn(30, 8))
     transported = GaussianMemory(transform_points(memory.means, G), G[:3, :3]@memory.covars@G[:3, :3].T,
                                  memory.alpha, memory.features)
-    model = SpatialBootstrap(dim, 8)
+    model = SpatialBootstrap(dim, 8).eval()
     tokens, features = torch.randn(h*w, dim), torch.randn(h*w, 8)
     T, _ = model(tokens, features, memory, K, h, w)
     TG, _ = model(tokens, features, transported, K, h, w)
@@ -73,3 +73,19 @@ def test_residual_refinement_receives_spatial_geometry_and_detaches_base_pose():
     assert T0.grad is None
     assert model.pose.net[-1].weight.grad.abs().sum() > 0
     assert world.shape == residual.shape == (2, 3, 3)
+
+
+def test_local_metric_readout_changes_covered_camera_rays_and_is_differentiable():
+    reader = RenderReader(latent_dim=8, token_dim=16)
+    points = torch.zeros(28, 42, 3, requires_grad=True)
+    rendered = RenderedMemory(torch.zeros(2, 3, 3), torch.randn(2, 3, 8), torch.ones(2, 3, 1)*2.,
+                              torch.zeros(2, 3, 1), torch.ones(2, 3, 1))
+    K = torch.tensor([[40., 0., 20.5], [0., 40., 13.5], [0., 0., 1.]])
+    output, confidence = reader.anchor_camera_geometry(points, rendered, K)
+    torch.testing.assert_close(output[..., 2], torch.ones(28, 42))
+    output.square().mean().backward()
+    assert reader.depth_confidence[-1].weight.grad.abs().sum() > 0
+    assert points.grad.abs().sum() > 0
+    rendered.opacity.zero_()
+    uncovered, _ = reader.anchor_camera_geometry(points, rendered, K)
+    torch.testing.assert_close(uncovered, points, atol=0, rtol=0)

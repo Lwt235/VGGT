@@ -1,4 +1,5 @@
 seed: 17
+architecture_revision: v2
 steps: 1500
 image_hw: [112, 140]
 receive_layer: 4

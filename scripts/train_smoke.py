@@ -13,7 +13,7 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.runtime import PROJECT_ROOT, configure_local_storage, load_config
+from src.runtime import PROJECT_ROOT, configure_local_storage, load_config, load_checkpoint_readonly
 configure_local_storage()
 
 import numpy as np
@@ -90,7 +90,19 @@ def main():
     (output_dir/"config.yaml").write_text(yaml.safe_dump(dict(config, steps=steps, diagnostic=args.diagnostic), sort_keys=False))
     print("Loading complete official VGGT/DINOv2/DPT checkpoint (read-only)", flush=True)
     model = VGGTSpatialMemory(runtime["assets"]["official_vggt_source"]["path"], weights,
-                               receive_layer=config["receive_layer"]).cuda().train()
+                               receive_layer=config["receive_layer"], revision=config.get('architecture_revision', 'v2')).cuda().train()
+    if config.get('initialize_from'):
+        origin = (PROJECT_ROOT/config['initialize_from']).resolve()
+        if not origin.is_relative_to(PROJECT_ROOT/'results'):
+            raise ValueError('Warm start must be from this new project, not historical sessions')
+        previous = load_checkpoint_readonly(origin)
+        parameters = dict(model.named_parameters())
+        with torch.no_grad():
+            for name, value in previous['trainable'].items():
+                parameters[name].copy_(value)
+        added = sorted(set(n for n,p in parameters.items() if p.requires_grad)-set(previous['trainable']))
+        print('Warm start from own-project checkpoint; newly initialized:', added, flush=True)
+        del previous
     samples = load_scene_samples(config, "cuda")
     pose_params = list(model.initial_pose.parameters())+list(model.refine_pose.parameters())
     native_params = [p for p in model.native.parameters() if p.requires_grad]
