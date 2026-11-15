@@ -284,13 +284,14 @@ class SpatialBootstrap(nn.Module):
 
 
 class SpatialRefinement(nn.Module):
-    def __init__(self, token_dim=2048, *, direct_residual=True, residual_only=False):
+    def __init__(self, token_dim=2048, *, direct_residual=True, residual_only=False, point_to_plane=False):
         super().__init__()
         self.token_project = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, 32), nn.GELU())
         # camera point, rendered point in T0 camera, metric residual, ray, O, var
         self.spatial = nn.Sequential(nn.Conv2d(46, 64, 3, padding=1), nn.GELU(), nn.Conv2d(64, 64, 3, padding=1), nn.GELU())
         self.pose = None if residual_only else PoseHead(64*4*5)
         self.residual_only = residual_only
+        self.point_to_plane = point_to_plane
         self.residual_modulator = None
         if residual_only:
             self.residual_modulator = nn.Linear(64*4*5, 3*4*5)
@@ -313,6 +314,11 @@ class SpatialRefinement(nn.Module):
         X_T0 = transform_points(camera_patch, fixed)
         opacity = rendered.opacity.reshape(-1, 1)
         residual_world = opacity*(rendered.world.reshape(-1, 3)-X_T0)
+        if self.point_to_plane:
+            if rendered.normal is None:
+                raise ValueError('Point-to-plane refinement requires O5 surface normals')
+            normal = rendered.normal.reshape(-1, 3)
+            residual_world = (residual_world*normal).sum(-1, keepdim=True)*normal
         residual_local = residual_world @ fixed[:3, :3]
         rendered_local = transform_points(rendered.world.reshape(-1, 3), invert_se3(fixed))*opacity
         _, rays, _ = world_rays(K, torch.eye(4, device=K.device), height, width)

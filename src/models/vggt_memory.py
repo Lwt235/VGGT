@@ -88,17 +88,19 @@ class VGGTSpatialMemory(nn.Module):
         self.native.requires_grad_(False)
         self.native.point_head.requires_grad_(True)
         self.native.aggregator.global_blocks[receive_layer].requires_grad_(True)
+        if revision == 'step2':
+            self.native.aggregator.global_blocks[11].requires_grad_(True)
         self.receive_layer = receive_layer
-        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h', 'v2i', 'v2j', 'v2k', 'v2l'):
+        if revision not in ('v2', 'v2b', 'v2c', 'v2g', 'v2h', 'v2i', 'v2j', 'v2k', 'v2l', 'step2'):
             raise ValueError('Unknown model revision')
         self.revision = revision
         self.pose_jitter_probability = pose_jitter_probability
         self.writer = TokenGaussianWriter(1024)
         self.fusion = SpatialMomentFusion()
-        self.render_reader = RenderReader(metric_depth=revision!='v2')
+        self.render_reader = RenderReader(metric_depth=revision!='v2', surface_normals=revision=='step2')
         self.pe_reader = ParameterPEReader(opacity_occlusion=revision!='v2')
-        self.initial_pose = SpatialBootstrap(ray_bundle=revision in ('v2k', 'v2l'), anisotropic=revision=='v2l') if revision in ('v2j', 'v2k', 'v2l') else LegacySpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
-        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i', 'v2j', 'v2k', 'v2l'), residual_only=revision in ('v2i', 'v2j', 'v2k', 'v2l'))
+        self.initial_pose = SpatialBootstrap(ray_bundle=revision in ('v2k', 'v2l', 'step2'), anisotropic=revision in ('v2l', 'step2')) if revision in ('v2j', 'v2k', 'v2l', 'step2') else LegacySpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
+        self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i', 'v2j', 'v2k', 'v2l', 'step2'), residual_only=revision in ('v2i', 'v2j', 'v2k', 'v2l', 'step2'), point_to_plane=revision=='step2')
 
     def train(self, mode=True):
         super().train(mode)
@@ -124,24 +126,24 @@ class VGGTSpatialMemory(nn.Module):
                                   for key in ("means", "covars", "alpha", "features")))
         # No image/token fields leave this function. Autograd retains only what
         # the current training step requires, never a subsequent query bypass.
-        reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i', 'v2j', 'v2k', 'v2l') else None
+        reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i', 'v2j', 'v2k', 'v2l', 'step2') else None
         return self.fusion(memory, reference_c2w=reference)
 
     def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False, read_jitter=None):
         if type(query) is not QueryInput:
             raise TypeError("Query accepts only RGB/K, not supervision or camera pose")
-        if read_jitter is not None and (not self.training or self.revision != 'v2l'):
+        if read_jitter is not None and (not self.training or self.revision not in ('v2l', 'step2')):
             raise ValueError('Read jitter is a v2l training augmentation only')
         rgb, K = query.rgb, query.K
         height, width = rgb.shape[-2:]
         hp, wp = height//14, width//14
         shallow = frozen_patch_tokens(self.native.aggregator, rgb)
         Kp = patch_intrinsics(K)
-        if self.revision in ('v2j', 'v2k', 'v2l'):
+        if self.revision in ('v2j', 'v2k', 'v2l', 'step2'):
             T0, diagnostic = None, {}
         else:
             T0, diagnostic = self.initial_pose(shallow[0].float(), self.writer.latent(shallow[0].float()), memory, Kp, hp, wp)
-        if self.training and self.revision not in ('v2', 'v2j', 'v2k', 'v2l') and torch.rand((), device=rgb.device) < self.pose_jitter_probability:
+        if self.training and self.revision not in ('v2', 'v2j', 'v2k', 'v2l', 'step2') and torch.rand((), device=rgb.device) < self.pose_jitter_probability:
             # Predicted-pose denoising: stochastic small *local* perturbations,
             # independent of GT, teach the residual head a stationary signal.
             from src.geometry import quat_wxyz_to_matrix
@@ -153,7 +155,7 @@ class VGGTSpatialMemory(nn.Module):
         def receive(tokens):
             nonlocal T0, T0_read
             with torch.autocast(device_type=rgb.device.type, enabled=False):
-                if self.revision in ('v2j', 'v2k', 'v2l'):
+                if self.revision in ('v2j', 'v2k', 'v2l', 'step2'):
                     T0, bootstrap = self.initial_pose(tokens.float(), self.writer.latent(shallow[0].float()),
                                                      memory, Kp, hp, wp, shallow=shallow[0].float())
                     diagnostic.update(bootstrap)
@@ -178,12 +180,12 @@ class VGGTSpatialMemory(nn.Module):
             if self.revision != 'v2':
                 camera_points, local_confidence = self.render_reader.anchor_camera_geometry(camera_points, diagnostic['rendered'], K)
             final = outputs[-1][0, 0, start:].float()
-            T1, X_T0, residual = self.refine_pose(final, raw_camera_points if self.revision in ('v2k', 'v2l') else camera_points,
+            T1, X_T0, residual = self.refine_pose(final, raw_camera_points if self.revision in ('v2k', 'v2l', 'step2') else camera_points,
                                                 T0_read, diagnostic['rendered'], Kp, hp, wp)
             points = transform_points(camera_points, T1)
-            coarse_points = transform_points(raw_camera_points if self.revision=='v2l' else camera_points, T0)
-        raw_geometry = {'raw_camera_points': raw_camera_points} if self.revision in ('v2k', 'v2l') else {}
-        if self.revision=='v2l':
+            coarse_points = transform_points(raw_camera_points if self.revision in ('v2l', 'step2') else camera_points, T0)
+        raw_geometry = {'raw_camera_points': raw_camera_points} if self.revision in ('v2k', 'v2l', 'step2') else {}
+        if self.revision in ('v2l', 'step2'):
             raw_geometry.update(T0_read=T0_read, read_jitter_applied=read_jitter is not None)
         return {"world_points": points, "coarse_world_points": coarse_points, "camera_points": camera_points, **raw_geometry,
                 "X_T0_patch": X_T0, "alignment_residual": residual, "T0": T0, "T1": T1,

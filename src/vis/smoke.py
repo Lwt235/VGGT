@@ -196,7 +196,7 @@ def v3(folder, scene, query, target, full, empty, render0, render1):
     axes[3].set(xlabel="world x [m]", ylabel="world z [m]", title="d · World output comparison")
     axes[3].legend(fontsize=6)
     axes[3].set_aspect("equal", adjustable="datalim")
-    fig.suptitle(f"V3 · {scene['name']} · geometric display render 112x140; trained read 8x10; no RGB memory")
+    fig.suptitle(f"V3 · {scene['name']} · geometric display render {rgb.shape[0]}x{rgb.shape[1]}; trained read {rgb.shape[0]//14}x{rgb.shape[1]//14}; no RGB memory")
     r0, t0 = pose_errors(full['T0'], target.c2w)
     r1, t1 = pose_errors(full['T1'], target.c2w)
     fig.supxlabel(f"Predicted pose only · R0→R1={float(r0):.2f}→{float(r1):.2f} deg; t0→t1={float(t0):.3f}→{float(t1):.3f} m", fontsize=10)

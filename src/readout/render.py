@@ -15,21 +15,39 @@ class RenderedMemory:
     depth: Tensor
     depth_variance: Tensor
     opacity: Tensor
+    normal: Tensor | None = None
 
 
 def normalize_rendered_moments(accumulated: Tensor, opacity: Tensor,
-                               latent_dim: int, eps=1e-6) -> RenderedMemory:
+                               latent_dim: int, eps=1e-6, *, with_normals=False) -> RenderedMemory:
     valid = opacity > eps
     expectation = torch.where(valid, accumulated / opacity.clamp_min(eps), 0.)
-    depth = expectation[..., -2:-1]
+    depth = expectation[..., 3+latent_dim:4+latent_dim]
+    second = expectation[..., 4+latent_dim:5+latent_dim]
+    normal = F.normalize(expectation[..., 5+latent_dim:8+latent_dim], dim=-1, eps=eps) if with_normals else None
     return RenderedMemory(expectation[..., :3], expectation[..., 3:3+latent_dim], depth,
-                          (expectation[..., -1:] - depth.square()).clamp_min(0), opacity)
+                          (second - depth.square()).clamp_min(0), opacity, normal)
+
+
+def camera_facing_normals(covars, means, center):
+    # Detached eigenvectors select the unoriented thin axis only. Two inverse
+    # iterations keep a finite differentiable covariance path without the
+    # undefined eigenvector backward of equal tangent eigenvalues.
+    with torch.no_grad():
+        seed = torch.linalg.eigh(covars.detach()).eigenvectors[..., 0]
+    eye = torch.eye(3, device=covars.device, dtype=covars.dtype)
+    normal = seed
+    for _ in range(2):
+        normal = F.normalize(torch.linalg.solve(covars+1e-8*eye, normal[..., None])[..., 0], dim=-1)
+    facing = ((center-means)*normal).sum(-1, keepdim=True)
+    return normal*torch.where(facing >= 0, 1., -1.)
 
 
 class RenderReader(nn.Module):
-    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True):
+    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False):
         super().__init__()
         self.latent_dim = latent_dim
+        self.surface_normals = surface_normals
         self.project = nn.Sequential(nn.Linear(latent_dim+5, token_dim), nn.GELU(), nn.Linear(token_dim, token_dim))
         self.unseen = nn.Parameter(torch.zeros(token_dim))
         self.norm = nn.LayerNorm(token_dim)
@@ -64,7 +82,7 @@ class RenderReader(nn.Module):
                height: int, width: int) -> RenderedMemory:
         # query_c2w must be a MODEL prediction. No GT camera parameter exists here.
         if len(memory) == 0:
-            accumulated = query_c2w.new_zeros(height, width, self.latent_dim+5)
+            accumulated = query_c2w.new_zeros(height, width, self.latent_dim+5+3*self.surface_normals)
             opacity = query_c2w.new_zeros(height, width, 1)
         else:
             if not memory.means.is_cuda:
@@ -73,12 +91,15 @@ class RenderReader(nn.Module):
             w2c = invert_se3(query_c2w)
             depth = transform_points(memory.means, w2c)[:, 2:3]
             attributes = torch.cat((memory.means, memory.features, depth, depth.square()), -1)
+            if self.surface_normals:
+                normals = camera_facing_normals(memory.covars, memory.means, query_c2w[:3, 3])
+                attributes = torch.cat((attributes, normals), -1)
             accumulated, opacity, _ = rasterization(
                 means=memory.means, quats=None, scales=None, covars=memory.covars,
                 opacities=memory.alpha, colors=attributes, viewmats=w2c[None],
                 Ks=K_patch[None], width=width, height=height, render_mode="RGB", packed=False)
             accumulated, opacity = accumulated[0], opacity[0]
-        return normalize_rendered_moments(accumulated, opacity, self.latent_dim)
+        return normalize_rendered_moments(accumulated, opacity, self.latent_dim, with_normals=self.surface_normals)
 
     def forward(self, tokens: Tensor, memory: GaussianMemory, query_c2w: Tensor,
                 K_patch: Tensor, height: int, width: int):
