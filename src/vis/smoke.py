@@ -405,7 +405,7 @@ def deliver_visualizations(model, samples, output_dir, records, *, camera_weight
         print("Visualizations generated:", scene_folder, flush=True)
     plot_training_curves(output_dir, records)
     (output_dir/"evaluation.json").write_text(json.dumps(all_metrics, indent=2)+"\n")
-    if model.revision in ('v2j', 'v2k'):
+    if model.revision in ('v2j', 'v2k', 'v2l'):
         grouped = {'covisible_queries': [], 'low_overlap_blind_queries': []}
         for scene in samples:
             metrics = all_metrics[scene['name']]
@@ -440,10 +440,16 @@ def plot_training_curves(output_dir, records):
                 ax.plot(steps[9:], np.convolve(values, np.ones(10)/10, mode="valid"), label=name, color=palette[index])
             ax.set(xlabel="Total updates", title=title)
             if key in ('rotation1_deg', 'translation1_m'):
-                coarse_key = key.replace('1_', '0_')
+                read_key = 'rotation_read_deg' if key=='rotation1_deg' else 'translation_read_m'
+                noisy_reads = read_key in data[0]
+                coarse_key = read_key if noisy_reads else key.replace('1_', '0_')
                 coarse = np.array([r[coarse_key] for r in data])
                 if len(coarse) >= 10:
                     ax.plot(steps[9:], np.convolve(coarse, np.ones(10)/10, mode='valid'), ls='--', color=palette[index], alpha=.7)
+                    if noisy_reads:
+                        clean = np.array([r[key.replace('1_', '0_')] for r in data])
+                        ax.plot(steps[9:], np.convolve(clean, np.ones(10)/10, mode='valid'), ls=':', color=palette[index], alpha=.7)
+                        ax.set_title(('Rotation [deg]' if key=='rotation1_deg' else 'Translation [m]')+'; dashed=read, dotted=clean, solid=T1', fontsize=9)
     axes[0].legend(fontsize=7)
     for key, color in [('o5', '#0072b2'), ('o6', '#d55e00')]:
         axes[4].plot([r['step'] for r in records], [r[key+'_gate'] for r in records], color=color, label=key+' mean |tanh gate|')
@@ -461,6 +467,34 @@ def plot_training_curves(output_dir, records):
     save(fig, output_dir/"vis/training_curves.png")
     if open_set:
         plot_open_set_curves(output_dir, records)
+    if 'lm_energy_final' in records[0]:
+        plot_lm_denoising_curves(output_dir, records)
+
+
+def plot_lm_denoising_curves(output_dir, records):
+    fig, grid = plt.subplots(2, 2, figsize=(11, 6), layout='constrained')
+    palette = ['#0072b2', '#d55e00', '#009e73']
+    for color, name in zip(palette, dict.fromkeys(r['scene'] for r in records)):
+        visible = [r for r in records if r['scene']==name and r['world_supervision_enabled']]
+        noisy = [r for r in visible if r['read_jitter_applied']]
+        for ax, data, values in (
+            (grid[0, 0], visible, [r['lm_energy_final']/max(1e-9,r['lm_energy_initial']) for r in visible]),
+            (grid[0, 1], visible, [r['lm_step_scale_mean'] for r in visible]),
+            (grid[1, 0], noisy, [r['rotation_read_deg']-r['rotation1_deg'] for r in noisy]),
+            (grid[1, 1], noisy, [100*(r['translation_read_m']-r['translation1_m']) for r in noisy])):
+            steps = np.array([r['step'] for r in data])
+            ax.plot(steps, values, alpha=.15, color=color)
+            if len(values)>=10:
+                ax.plot(steps[9:], np.convolve(values, np.ones(10)/10, mode='valid'), color=color, label=name)
+    for ax, title in zip(grid.flatten(), ('LM E_final / E_initial (observable)', 'LM mean accepted step scale',
+                                         'Noisy read → T1 rotation gain [deg]', 'Noisy read → T1 translation gain [cm]')):
+        ax.set(title=title, xlabel='Total updates')
+        ax.legend(fontsize=7)
+    grid[0, 0].axhline(1, color='grey', lw=.7, ls='--')
+    for ax in grid[1]:
+        ax.axhline(0, color='grey', lw=.7, ls='--')
+    fig.suptitle('LM energy and training-only read denoising; clean T0 supervision is unchanged')
+    save(fig, output_dir/'vis/lm_denoising_training_curves.png')
 
 
 def plot_open_set_curves(output_dir, records):

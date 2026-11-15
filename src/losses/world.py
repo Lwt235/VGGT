@@ -55,9 +55,10 @@ def _legacy_world_loss(output, target, *, camera_weight=.5, refinement_safety_we
     camera_alignment = (output.get('raw_camera_points', output['camera_points'])[valid]-camera_truth[valid]).abs().mean()
     # Training supervision only: the reference is detached, so this cannot
     # reward making T0 worse. Inference always returns the predicted T1.
-    r0_angle = rotation_geodesic(coarse[:3, :3], target.c2w[:3, :3])
+    safety_reference = output.get('T0_read', coarse)
+    r0_angle = rotation_geodesic(safety_reference[:3, :3], target.c2w[:3, :3])
     r1_angle = rotation_geodesic(refined[:3, :3], target.c2w[:3, :3])
-    t0_error = (coarse[:3, 3]-target.c2w[:3, 3]).norm()
+    t0_error = (safety_reference[:3, 3]-target.c2w[:3, 3]).norm()
     t1_error = (refined[:3, 3]-target.c2w[:3, 3]).norm()
     safety = F.relu(r1_angle-r0_angle.detach())+F.relu(t1_error-t0_error.detach())
     loss = point + .25*coarse_point + pose + anchor_weight*anchor + matching_weight*match + camera_weight*camera_alignment
@@ -75,6 +76,22 @@ def _legacy_world_loss(output, target, *, camera_weight=.5, refinement_safety_we
                   "translation0_m": t0.item(), "translation1_m": t1.item()}
 
 
+@torch.no_grad()
+def surface_support_rate(means, covars, target):
+    """Criterion-only label; never supplied to model inference."""
+    if not len(means):
+        return target.world_points.new_zeros(())
+    means, covars = means.detach(), covars.detach()
+    precision = torch.linalg.inv(covars)
+    points = target.world_points[target.valid]
+    covered = points.new_zeros(())
+    for start in range(0, len(points), 2048):
+        delta = points[start:start+2048, None]-means[None]
+        distance = torch.einsum('pmi,mij,pmj->pm', delta, precision, delta)
+        covered += (distance <= 9).any(-1).float().sum()
+    return covered/max(1, len(points))
+
+
 def open_set_matching_loss(output, target, erased_reference=None):
     """GT surface support and positive/negative labels live ONLY in criterion."""
     h, w = output['rendered'].opacity.shape[:2]
@@ -90,13 +107,7 @@ def open_set_matching_loss(output, target, erased_reference=None):
             rho2 = torch.einsum('qmi,mij,qmj->qm', diff, precision, diff)
             minimum = rho2.min(-1).values
             teacher = (-rho2/2).softmax(-1)
-            points = target.world_points[valid]
-            covered = points.new_zeros(())
-            for start in range(0, len(points), 2048):
-                delta = points[start:start+2048, None]-means[None]
-                distance = torch.einsum('pmi,mij,pmj->pm', delta, precision, delta)
-                covered += (distance <= 9).any(-1).float().sum()
-            support_rate = covered/max(1, len(points))
+            support_rate = surface_support_rate(means, covars, target)
         else:
             minimum = world.new_full((h*w,), float('inf'))
             teacher = world.new_zeros(h*w, 0)
@@ -157,4 +168,8 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
                    match_mass=float(output['match_mass'].detach()))
     if 'raw_camera_points' in output:
         metrics['anchored_camera_epe_m'] = float((output['camera_points'][target.valid]-camera_truth[target.valid]).detach().norm(dim=-1).mean())
+    if 'T0_read' in output:
+        rr, tr = pose_errors(output['T0_read'].detach(), target.c2w)
+        metrics.update(rotation_read_deg=float(rr), translation_read_m=float(tr),
+                       read_jitter_applied=float(output['read_jitter_applied']))
     return loss, metrics

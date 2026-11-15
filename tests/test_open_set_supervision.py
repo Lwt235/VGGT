@@ -86,3 +86,14 @@ def test_partial_zero_overlap_cannot_restore_world_pose_supervision():
     loss.backward()
     assert t.grad is None or t.grad.abs() == 0
     assert logits.grad[:, -1].sum() < 0
+
+
+def test_refinement_safety_compares_read_pose_not_clean_bootstrap():
+    truth, output, _, _, _ = example()
+    output['T0'] = torch.eye(4)
+    output['T0_read'] = torch.eye(4); output['T0_read'][0, 3] = .1
+    output['T1'] = torch.eye(4); output['T1'][0, 3] = .05
+    output['read_jitter_applied'] = True
+    _, metrics = world_loss(output, truth, refinement_safety_weight=2.)
+    assert metrics['refinement_regression_penalty'] == 0
+    assert metrics['translation0_m'] == 0 and metrics['translation_read_m'] > .09

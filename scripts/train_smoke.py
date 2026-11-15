@@ -124,7 +124,7 @@ def main():
         del previous
     samples = load_scene_samples(config, "cuda")
     residual_params = list(model.refine_pose.residual_pose.parameters()) if model.refine_pose.residual_pose is not None else []
-    bootstrap_params = list(model.initial_pose.parameters()) if config.get('architecture_revision') in ('v2j', 'v2k') else []
+    bootstrap_params = list(model.initial_pose.parameters()) if config.get('architecture_revision') in ('v2j', 'v2k', 'v2l') else []
     pose_params = [p for p in list(model.initial_pose.parameters())+list(model.refine_pose.parameters())
                    if id(p) not in {id(g) for g in residual_params+bootstrap_params}]
     native_params = [p for p in model.native.parameters() if p.requires_grad]
@@ -173,11 +173,26 @@ def main():
             mapping, target, gauge = augment_training_world(scene["mapping"], target)
             memory = model.build_memory(mapping)
             memory.retain_grad()
-            prediction = model(query, memory)
+            read_jitter = None
+            if config.get('architecture_revision') == 'v2l':
+                from src.losses.world import surface_support_rate
+                from src.models.ellipsoid_pose import sample_read_jitter
+                # GT supports only the training-augmentation schedule. The
+                # model receives a random local transform, never GT/flags.
+                if random.random() < config.get('read_jitter_probability', .5) and surface_support_rate(memory.means, memory.covars, target) >= .05:
+                    read_jitter = sample_read_jitter(query.rgb.device)
+                prediction = model(query, memory, read_jitter=read_jitter)
+            else:
+                prediction = model(query, memory)
             loss, metrics = world_loss(prediction, target, camera_weight=config.get('camera_alignment_weight', .5),
                                        refinement_safety_weight=config.get('refinement_safety_weight', 0.),
                                        anchor_weight=config.get('anchor_alignment_weight', .2),
                                        matching_weight=config.get('matching_weight', .2), depth_weight=config.get('patch_depth_weight', 1.))
+            if 'lm_energy_history' in prediction:
+                history = prediction['lm_energy_history'].detach()
+                metrics.update(lm_energy_initial=float(history[0]), lm_energy_final=float(history[-1]),
+                               lm_energy_nonincreasing=float((torch.diff(history) <= 1e-6).all()),
+                               lm_step_scale_mean=float(prediction['lm_accepted_scales'].detach().mean()))
             if config.get('mapping_self_observation'):
                 mapping_loss, mapping_metrics = supervise_mapping_observation(model, memory, mapping[(step//3) % len(mapping)])
                 loss = loss+mapping_loss
@@ -189,7 +204,7 @@ def main():
             # Sequential backwards avoid retaining two native VGGT graphs.
             # Only pose is supervised on this partial-map branch; it is NOT
             # trained to invent missing local geometry or to create degradation.
-            if config.get('paired_pose_consistency') and (step//3) % 2 == 0 and metrics.get('world_supervision_enabled', 1.) > 0:
+            if config.get('paired_pose_consistency') and (step//3) % 2 == 0 and metrics.get('world_supervision_enabled', 1.) > 0 and read_jitter is None:
                 teacher = {key: prediction[key].detach() for key in ('T0', 'T1')}
                 probability = prediction['bootstrap_attention'].detach().mean(0)
                 index = torch.multinomial(probability+.001, 1)[0]

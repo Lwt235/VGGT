@@ -1,5 +1,6 @@
 import math
 import torch
+import pytest
 from src.augmentation import sample_world_gauge, transform_supervision
 from src.data import QueryInput, Supervision
 from src.geometry import transform_points
@@ -288,7 +289,8 @@ def test_v2k_spatial_geometry_adaptive_dustbin_and_gauge_independence():
     torch.testing.assert_close(rejected, torch.eye(4), atol=1e-6, rtol=1e-6)
 
 
-def test_v2k_refinement_receives_raw_native_points_before_local_depth_anchor(monkeypatch):
+@pytest.mark.parametrize('revision', ['v2k', 'v2l'])
+def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeypatch, revision):
     from types import SimpleNamespace
     from torch import nn
     import src.models.vggt_memory as adapter
@@ -299,10 +301,14 @@ def test_v2k_refinement_receives_raw_native_points_before_local_depth_anchor(mon
         def forward(self, *args, **kwargs):
             return raw[None, None], None
     class Bootstrap(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = torch.eye(4, requires_grad=True)
         def forward(self, *args, **kwargs):
-            return torch.eye(4), {}
+            return self.base, {}
     class Render(nn.Module):
         def forward(self, tokens, *args):
+            self.seen_pose = args[1]
             return tokens, rendered
         def anchor_camera_geometry(self, points, *args):
             return points+1, torch.ones(2, 3, 1)
@@ -313,12 +319,13 @@ def test_v2k_refinement_receives_raw_native_points_before_local_depth_anchor(mon
         def forward(self, tokens, points, *args):
             assert points.data_ptr() == raw.data_ptr()
             torch.testing.assert_close(points, raw, atol=0, rtol=0)
-            return torch.eye(4), torch.zeros(2, 3, 3), torch.zeros(2, 3, 3)
+            self.seen_pose = args[0]
+            return args[0], torch.zeros(2, 3, 3), torch.zeros(2, 3, 3)
     model = adapter.VGGTSpatialMemory.__new__(adapter.VGGTSpatialMemory)
     nn.Module.__init__(model)
-    model.revision, model.receive_layer = 'v2k', 4
+    model.revision, model.receive_layer = revision, 4
     model.native = nn.Module()
-    model.native.aggregator = SimpleNamespace()
+    model.native.aggregator = SimpleNamespace(patch_embed=nn.Identity())
     model.native.point_head = NativeHead()
     model.writer = nn.Module(); model.writer.latent = nn.Identity()
     model.initial_pose, model.render_reader, model.pe_reader, model.refine_pose = Bootstrap(), Render(), PE(), Refinement()
@@ -333,3 +340,16 @@ def test_v2k_refinement_receives_raw_native_points_before_local_depth_anchor(mon
     assert prediction['raw_camera_points'].data_ptr() == raw.data_ptr()
     torch.testing.assert_close(prediction['camera_points'], raw+1)
     torch.testing.assert_close(prediction['world_points'], raw+1)
+    if revision=='v2l':
+        from src.models.ellipsoid_pose import sample_read_jitter
+        jitter = sample_read_jitter('cpu')
+        noisy = model(query, memory, read_jitter=jitter)
+        torch.testing.assert_close(noisy['T0'], prediction['T0'])
+        torch.testing.assert_close(noisy['T0_read'], jitter)
+        torch.testing.assert_close(model.render_reader.seen_pose, jitter)
+        torch.testing.assert_close(model.refine_pose.seen_pose, jitter)
+        torch.testing.assert_close(noisy['coarse_world_points'], raw)
+        assert not noisy['T0_read'].requires_grad and noisy['T0'].requires_grad
+        model.eval()
+        with pytest.raises(ValueError, match='training augmentation'):
+            model(query, memory, read_jitter=jitter)

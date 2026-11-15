@@ -26,6 +26,8 @@ from src.losses.world import pose_errors
 
 
 def initial_votes(output, memory):
+    if 'posterior_covars' in output:
+        return (1-output['dustbin_probability'])*output['c_depth']
     weights = output['bootstrap_attention']
     confidence = 1+(weights*weights.clamp_min(1e-9).log()).sum(-1)/math.log(max(2, len(memory)))
     return (1-output['dustbin_probability'])*output['c_depth']*anchor_vote_weights(
@@ -77,22 +79,26 @@ def main():
         anchors = full['anchors']
         votes, after_votes = initial_votes(full, memory), initial_votes(after, partial)
         _, rays, _ = world_rays(patch_intrinsics(query.K), torch.eye(4, device=camera.device), hp, wp)
-        def solve(points, world, weight):
+        def solve(points, world, weight, covariance=None):
+            if model.revision=='v2l':
+                from src.models.ellipsoid_pose import anisotropic_ray_pose
+                return anisotropic_ray_pose(points, rays, world, covariance, weight)
             return whitened_irls_pose(points, rays, world, weight) if model.revision=='v2k' else point_irls_pose(points, world, weight)
-        baseline, _ = solve(camera, anchors, votes)
+        covariance, after_covariance = full.get('posterior_covars'), after.get('posterior_covars')
+        baseline, _ = solve(camera, anchors, votes, covariance)
         moments = {}
-        for label, values, weights in (
-            ('votes_changed_only', anchors, after_votes),
-            ('anchors_changed_only', after['anchors'], votes),
-            ('both_changed', after['anchors'], after_votes)):
-            predicted, _ = solve(camera, values, weights)
+        for label, values, weights, cov in (
+            ('votes_changed_only', anchors, after_votes, covariance),
+            ('anchors_changed_only', after['anchors'], votes, covariance),
+            ('both_changed', after['anchors'], after_votes, after_covariance)):
+            predicted, _ = solve(camera, values, weights, cov)
             rot, trans = pose_errors(predicted, baseline)
             moments[label] = dict(rotation_change_deg=float(rot), translation_change_m=float(trans))
         # Exact-correspondence control uses the model's own full pose and its
         # own camera points. It has no GT transform, no effect on normal V5.
         exact = transform_points(camera, baseline)
-        Tfull, _ = solve(camera, exact, votes)
-        Tpartial, _ = solve(camera, exact, after_votes*(~lost))
+        Tfull, _ = solve(camera, exact, votes, covariance)
+        Tpartial, _ = solve(camera, exact, after_votes*(~lost), covariance)
         rot, trans = pose_errors(Tpartial, Tfull)
         residual = (anchors-transform_points(camera, baseline)).norm(dim=-1)
         anchor_change = (after['anchors']-anchors).norm(dim=-1)

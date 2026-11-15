@@ -188,9 +188,10 @@ def whitened_irls_pose(camera_points, rays, anchors, weights, *, tau_perp=.08,
 
 class SpatialBootstrap(nn.Module):
     """Memory-independent camera geometry, open-set matches, invariant moments."""
-    def __init__(self, token_dim=1024, latent_dim=256, *, ray_bundle=False):
+    def __init__(self, token_dim=1024, latent_dim=256, *, ray_bundle=False, anisotropic=False):
         super().__init__()
         self.ray_bundle = ray_bundle
+        self.anisotropic = anisotropic
         self.key_dropout_mode = 'none'
         self.query_residual = nn.Linear(token_dim+3, latent_dim)
         self.key_residual = nn.Linear(latent_dim+4, latent_dim)
@@ -257,8 +258,17 @@ class SpatialBootstrap(nn.Module):
         inlier = W[:, :-1]/p_match[:, None].clamp_min(1e-6)
         anchors = inlier @ memory.means
         entropy_confidence = 1+(inlier*inlier.clamp_min(1e-9).log()).sum(-1)/math.log(max(2, len(memory)))
-        weights = p_match*c_depth*anchor_vote_weights(inlier, memory, anchors, entropy_confidence)
-        T, votes = whitened_irls_pose(points, rays, anchors, weights) if self.ray_bundle else point_irls_pose(points, anchors, weights)
+        extras = {}
+        if self.anisotropic:
+            from src.models.ellipsoid_pose import posterior_ellipsoids, anisotropic_ray_pose
+            anchors, covariance = posterior_ellipsoids(inlier, memory)
+            weights = p_match*c_depth
+            T, votes, lm = anisotropic_ray_pose(points, rays, anchors, covariance, weights, return_diagnostic=True)
+            extras = dict(posterior_covars=covariance, lm_energy_history=lm['energy_history'],
+                          lm_accepted_scales=lm['accepted_scales'])
+        else:
+            weights = p_match*c_depth*anchor_vote_weights(inlier, memory, anchors, entropy_confidence)
+            T, votes = whitened_irls_pose(points, rays, anchors, weights) if self.ray_bundle else point_irls_pose(points, anchors, weights)
         # On observable matches this is exactly one in floating point. Identity
         # fallback in the unobservable regime is intentionally not gauge equivariant.
         quality = ((p_match.sum()-.25)/.025).sigmoid()
@@ -270,7 +280,7 @@ class SpatialBootstrap(nn.Module):
         return T, dict(anchors=anchors, confidence=p_match, camera_patch_points=points, z_cam=z, c_depth=c_depth,
             matching_attention=W, dustbin_probability=W[:, -1], bootstrap_attention=inlier,
             bootstrap_support=torch.ones(len(memory), device=z.device, dtype=torch.bool),
-            anchor_votes=votes, match_mass=p_match.sum())
+            anchor_votes=votes, match_mass=p_match.sum(), **extras)
 
 
 class SpatialRefinement(nn.Module):
