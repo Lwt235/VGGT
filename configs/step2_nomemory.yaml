@@ -10,16 +10,10 @@ image_hw:
 receive_layer: 4
 downstream_trainable_global_block: 11
 camera_alignment_weight: 0.2
-patch_depth_weight: 2.0
 relative_depth_weight: 0.2
 optimizer:
   heads_lr: 0.0003
   pose_lr: 0.0002
-  bootstrap_lr: 0.0003
-  dustbin_lr: 0.005
-  dustbin_head_lr: 0.0005
-  gate_lr: 0.001
-  refinement_geometry_lr: 0.0002
   native_lr: 3.0e-06
   warmup_steps: 200
   end_lr_ratio: 0.1
@@ -38,7 +32,6 @@ description: Fresh official single-frame VGGT+DPT+pose; RGB/K only, no mapping i
   or public Gaussian memory, no random world gauge. Same fixed split, resolution,
   18k and exact query episode schedule as Full.
 checkpoint_milestones:
-- 0
 - 3000
 - 18000
 source_full_run: step2_v4_full_seed17
