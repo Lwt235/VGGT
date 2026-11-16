@@ -181,4 +181,3 @@ No-Memory完整验证的跨场景3k/6k/12k/18k EPE为0.8077/0.8526/0.9220/0.8998
 - [两级位姿、尾部与局部因果补充](step2_full18k_diagnostics.md)、[Full 3k→18k读取/深度诊断](step2_full18k_depth_notes.md)、[最终三方定量补充](step2_final_quantitative_notes.md)。
 
 本轮Step2主对比已按预算交付，停下汇报。后续若继续，应围绕远距深度偏置、匹配后验与GT位姿精化目标不一致以及真实尾部失败定位；Render-Only/PE-Only/Isotropic-Point及Step3尚未启动，等待用户确认。
-
