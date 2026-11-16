@@ -16,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--min-free-mib", type=int, default=12288)
     parser.add_argument("--memory-fraction", type=float, default=.08)
+    parser.add_argument("--gpu", type=int, help="Optional physical GPU index; all live resource checks still apply")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -25,7 +26,8 @@ def main():
     snapshot = subprocess.check_output(["nvidia-smi", "--query-gpu=index,uuid,memory.free,memory.used,memory.total", "--format=csv,noheader,nounits"], text=True)
     processes = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"], text=True)
     rows = [line.split(", ") for line in snapshot.strip().splitlines()]
-    candidates = [row for row in rows if int(row[2]) >= max(args.min_free_mib, int(row[4])*args.memory_fraction + 2048)]
+    candidates = [row for row in rows if (args.gpu is None or int(row[0]) == args.gpu)
+                  and int(row[2]) >= max(args.min_free_mib, int(row[4])*args.memory_fraction + 2048)]
     if not candidates:
         raise SystemExit("Insufficient free memory for the configured cap and 2 GiB reserve; no work launched")
     selected = max(candidates, key=lambda row: int(row[2]))

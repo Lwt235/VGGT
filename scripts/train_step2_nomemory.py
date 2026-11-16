@@ -130,6 +130,7 @@ def main():
             for key,value in state['trainable'].items():parameters[key].copy_(value)
         optimizer.load_state_dict(state['optimizer']);scheduler.load_state_dict(state['scheduler']);start=state['step']
         random.setstate(state['python_rng']);torch.set_rng_state(state['torch_rng']);torch.cuda.set_rng_state_all(state['cuda_rng']);del state
+        print('RESUME own Local model/Adam/scheduler/Python/CPU/CUDA RNG:',start,flush=True)
     records=[json.loads(l) for l in (folder/'metrics.jsonl').read_text().splitlines()] if args.resume else []
     validation=[json.loads(l) for l in (folder/'validation.jsonl').read_text().splitlines()] if args.resume else []
     if not args.resume and not args.profile:
