@@ -14,6 +14,41 @@ def center_pe(means: Tensor, bands=8):
     return torch.cat((phase.sin(), phase.cos()), -1).flatten(-2)
 
 
+def covariance_spectrum_and_thin_axis(covars: Tensor):
+    """Keep eigh's exact forward, without its all-eigenvector backward.
+
+    Repeated tangent eigenvalues do not make a unique thin axis ambiguous, but
+    the generic eigh backward still divides by their zero gap. Spectrum values
+    use Hellmann--Feynman derivatives; only the thin axis uses an implicit solve.
+    Both reattachments are zero in forward, preserving eigh's ordering/sign.
+    """
+    with torch.no_grad():
+        values, vectors = torch.linalg.eigh(covars)
+        thin = vectors[..., 0]
+    if not torch.is_grad_enabled() or not covars.requires_grad:
+        return values, thin
+    delta = covars-covars.detach()
+    values_live = values+(vectors.transpose(-1, -2) @ delta @ vectors).diagonal(dim1=-2, dim2=-1)
+
+    # Covariances are symmetric; symmetrizing the derivative also matches the
+    # Hermitian eigh contract for their unconstrained matrix representation.
+    matrix = covars.to(torch.float64)
+    matrix = (matrix+matrix.transpose(-1, -2))*.5
+    normal = thin.to(torch.float64)
+    scale = matrix.detach().diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-12)
+    eye = torch.eye(3, device=covars.device, dtype=torch.float64)
+    # Relative damping bounds the derivative when even the minimum is repeated;
+    # 1e-6 also covers float32 eigensolver roundoff in the float64 solve. It
+    # changes no forward covariance/axis and introduces no preferred direction.
+    damping = 1e-6*scale
+    system = (matrix-values[..., 0, None, None].to(torch.float64)*eye
+              +scale[..., None, None]*normal[..., :, None]*normal[..., None, :]
+              +damping[..., None, None]*eye)
+    solved = torch.linalg.solve(system, normal[..., None])[..., 0]
+    normal_live = F.normalize(solved, dim=-1).to(covars.dtype)
+    return values_live, thin+(normal_live-normal_live.detach())
+
+
 def active_memory(memory, query_c2w, K, height, width, *, budget=2048, margin=.25, isotropic=False):
     """Read budget is separate from stored memory; functional view only.
 
@@ -87,9 +122,8 @@ class ParameterPEReader(nn.Module):
             variance = covars.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-10)
             log_scales = variance.sqrt().log()[:, None].expand(-1, 3)
         else:
-            eigenvalues, eigenvectors = torch.linalg.eigh(covars)
+            eigenvalues, normals = covariance_spectrum_and_thin_axis(covars)
             log_scales = eigenvalues.clamp_min(1e-10).sqrt().log()
-            normals = eigenvectors[..., 0]
         position = tokens.new_zeros(nquery, 6*self.bands)
         if rendered is not None:
             position = center_pe(rendered_world.reshape(-1, 3), self.bands)*rendered.opacity.reshape(-1, 1)
