@@ -28,11 +28,11 @@ def local_se3_exp(omega, nu):
     return I+a*W+b*W2, (I+b*W+c*W2) @ nu
 
 
-def sample_read_jitter(device, *, dtype=torch.float32):
+def sample_read_jitter(device, *, dtype=torch.float32, include_zero=False):
     axis = F.normalize(torch.randn(3, device=device, dtype=dtype), dim=0)
-    omega = axis*torch.deg2rad(torch.empty((), device=device, dtype=dtype).uniform_(2., 3.))
+    omega = axis*torch.deg2rad(torch.empty((), device=device, dtype=dtype).uniform_(0. if include_zero else 2., 3.))
     direction = F.normalize(torch.randn(3, device=device, dtype=dtype), dim=0)
-    translation = direction*torch.empty((), device=device, dtype=dtype).uniform_(.05, .06)
+    translation = direction*torch.empty((), device=device, dtype=dtype).uniform_(0. if include_zero else .05, .06)
     R, _ = local_se3_exp(omega, translation)
     return torch.cat((torch.cat((R, translation[:, None]), -1), translation.new_tensor([[0., 0., 0., 1.]])), 0)
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fresh Step2 training. Query input is always RGB/K; no smoke warm-start.
 
-The 3000-step process exits for actual metric/image inspection. The calling
-agent may continue this exact optimizer state without extra approval if healthy.
+Older revisions support the 3000-step inspection stop. V4 runs continuously
+through 18k under the configured numerical/gradient/systemic-EPE guard.
 """
 import argparse
 import json
@@ -102,6 +102,7 @@ def evaluate(model, dataset, config, folder, step, *, quick=False, interventions
         wanted_vis = visualize and spec['scene'].split('/')[0] in ('harvard_c5', 'harvard_c6', 'harvard_c11', 'harvard_robotics_lab') and spec['scene'] not in visualized
         full = model(query, memory, return_attention=wanted_vis)
         _, metrics = criterion(full, target, config)
+        metrics['depth_confidence_mean'] = float(full['local_geometry_confidence'].mean())
         if 'camera_scale' in full:
             metrics.update(camera_scale=float(full['camera_scale']), depth_confidence_mean=float(full['local_geometry_confidence'].mean()))
         item = dict(**spec, **metrics, public_gaussians=len(memory), active_gaussians=len(full['attention']['indices']))
@@ -159,7 +160,7 @@ def save_checkpoint(model, optimizer, scheduler, config, folder, step, weights):
     path = folder/'training_state.pt'
     torch.save(checkpoint, folder/'training_state.tmp')
     (folder/'training_state.tmp').replace(path)
-    if step in (config['midpoint_steps'], config['steps']):
+    if step in config.get('checkpoint_milestones', (config['midpoint_steps'], config['steps'])):
         snapshot = folder/f'training_state_{step:05d}.pt'
         if not snapshot.exists():
             # Zero-copy milestone: later atomic latest-checkpoint replacement
@@ -213,6 +214,7 @@ def main():
     records = [json.loads(l) for l in (folder/'metrics.jsonl').read_text().splitlines()] if args.resume else []
     validation = [json.loads(l) for l in (folder/'validation.jsonl').read_text().splitlines()] if args.resume else []
     if not args.profile and not args.resume:
+        save_checkpoint(model, optimizer, scheduler, config, folder, 0, weights) if config.get('continuous_training') else None
         validation += evaluate(model, dataset, config, folder, 0)
         (folder/'validation.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in validation))
     modules = dict(writer=model.writer, o5=model.render_reader, o6=model.pe_reader, dpt=model.native.point_head,
@@ -227,9 +229,10 @@ def main():
             mapping, target, _ = augment_training_world(episode['mapping'], target)
             optimizer.zero_grad(set_to_none=True)
             memory = model.build_memory(mapping); memory.retain_grad()
-            read_jitter = sample_read_jitter('cuda') if random.random() < config['read_jitter_probability'] and surface_support_rate(memory.means, memory.covars, target) >= .05 else None
+            read_jitter = sample_read_jitter('cuda', include_zero=config.get('architecture_revision')=='step2_v4') if random.random() < config['read_jitter_probability'] and surface_support_rate(memory.means, memory.covars, target) >= .05 else None
             prediction = model(query, memory, read_jitter=read_jitter)
             loss, metrics = criterion(prediction, target, config)
+            metrics['depth_confidence_mean'] = float(prediction['local_geometry_confidence'].detach().mean())
             if 'camera_scale' in prediction:
                 metrics.update(camera_scale=float(prediction['camera_scale'].detach()), depth_confidence_mean=float(prediction['local_geometry_confidence'].detach().mean()))
             lm = prediction['lm_energy_history']
@@ -271,9 +274,13 @@ def main():
             if not args.profile and ((step+1) % config['quick_eval_every']==0 or step+1 == until):
                 full = step+1 in config['full_eval_steps'] or step+1 == until
                 validation += evaluate(model,dataset,config,folder,step+1,quick=not full,
-                    interventions=step+1 >= config['midpoint_steps'], visualize=step+1 == until)
+                    interventions=full and step+1 >= config['midpoint_steps'], visualize=full and (config.get('continuous_training', False) or step+1 == until))
                 (folder/'validation.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in validation))
                 curves(folder/'vis', records, validation)
+                if config.get('continuous_training') and step+1 >= config['midpoint_steps'] and full:
+                    current = [r for r in validation if r['step']==step+1 and r['group']=='cross_scene_val'][-1]
+                    if current['point_epe_m'] > config['systemic_epe_limit_m']:
+                        raise RuntimeError('Systemic cross-scene EPE collapse above configured limit: '+str(current['point_epe_m']))
             if step > 50 and (step+1) % 100 == 0:
                 for name in ('writer','o5','o6','downstream'):
                     if not any(r['module_grad_norms'][name] > 0 for r in records[-50:]): raise RuntimeError('Persistent disconnected '+name)

@@ -289,7 +289,7 @@ def test_v2k_spatial_geometry_adaptive_dustbin_and_gauge_independence():
     torch.testing.assert_close(rejected, torch.eye(4), atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.parametrize('revision', ['v2k', 'v2l', 'step2_v2', 'step2_v3'])
+@pytest.mark.parametrize('revision', ['v2k', 'v2l', 'step2_v2', 'step2_v3', 'step2_v4'])
 def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeypatch, revision):
     from types import SimpleNamespace
     from torch import nn
@@ -309,18 +309,19 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
     class Render(nn.Module):
         def forward(self, tokens, *args):
             self.seen_pose = args[1]
+            if hasattr(self, 'final_pose'): del self.final_pose
             return tokens, rendered
         def calibrate_camera_scale(self, points, rendered):
             return points*2, points.new_tensor(2.)
         def render(self, memory, pose, *args):
-            if revision == 'step2_v3':
+            if revision in ('step2_v3', 'step2_v4'):
                 assert not pose.requires_grad
             self.final_pose = pose
             self.final_render = RenderedMemory(rendered.world, rendered.features, rendered.depth+1,
                                                rendered.depth_variance, rendered.opacity)
             return self.final_render
         def anchor_camera_geometry(self, points, *args):
-            if revision in ('step2_v2', 'step2_v3'):
+            if revision in ('step2_v2', 'step2_v3') or (revision == 'step2_v4' and hasattr(self, 'final_pose')):
                 assert hasattr(self, 'final_pose')
                 assert args[0] is self.final_render
             return points+1, torch.ones(2, 3, 1)
@@ -332,14 +333,14 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
             super().__init__()
             self.correction = nn.Parameter(torch.tensor(.2))
         def forward(self, tokens, points, *args):
-            if revision == 'step2_v3':
-                torch.testing.assert_close(points, raw*2)
+            if revision in ('step2_v3', 'step2_v4'):
+                torch.testing.assert_close(points, raw+1 if revision == 'step2_v4' else raw*2)
             else:
                 assert points.data_ptr() == raw.data_ptr()
                 torch.testing.assert_close(points, raw, atol=0, rtol=0)
             self.seen_pose = args[0]
             refined = args[0]
-            if revision in ('step2_v2', 'step2_v3'):
+            if revision in ('step2_v2', 'step2_v3', 'step2_v4'):
                 delta = torch.eye(4); delta[2, 3] = self.correction
                 refined = refined @ delta
             return refined, torch.zeros(2, 3, 3), torch.zeros(2, 3, 3)
@@ -362,12 +363,12 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
     assert prediction['raw_camera_points'].data_ptr() == raw.data_ptr()
     baseline = raw*2 if revision == 'step2_v3' else raw
     torch.testing.assert_close(prediction['camera_points'], baseline+1)
-    expected_world = baseline+1+(raw.new_tensor([0., 0., .2]) if revision in ('step2_v2', 'step2_v3') else 0)
+    expected_world = baseline+1+(raw.new_tensor([0., 0., .2]) if revision in ('step2_v2', 'step2_v3', 'step2_v4') else 0)
     torch.testing.assert_close(prediction['world_points'], expected_world)
-    if revision in ('step2_v2', 'step2_v3'):
+    if revision in ('step2_v2', 'step2_v3', 'step2_v4'):
         torch.testing.assert_close(model.render_reader.final_pose, prediction['T1'])
         assert not torch.equal(model.render_reader.final_pose, prediction['T0_read'])
-    if revision == 'step2_v3':
+    if revision in ('step2_v3', 'step2_v4'):
         prediction['T1'].retain_grad()
         (prediction['world_points'].square().mean()+prediction['camera_points'].square().mean()).backward(retain_graph=True)
         assert prediction['T1'].grad is None
@@ -375,7 +376,7 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
         assert torch.isfinite(raw.grad).all() and raw.grad.abs().sum()>0
         prediction['T1'][:3,3].square().sum().backward()
         assert model.refine_pose.correction.grad.abs()>0
-    if revision in ('v2l', 'step2_v2', 'step2_v3'):
+    if revision in ('v2l', 'step2_v2', 'step2_v3', 'step2_v4'):
         from src.models.ellipsoid_pose import sample_read_jitter
         jitter = sample_read_jitter('cpu')
         noisy = model(query, memory, read_jitter=jitter)

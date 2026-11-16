@@ -286,7 +286,7 @@ class SpatialBootstrap(nn.Module):
 
 
 class SpatialRefinement(nn.Module):
-    def __init__(self, token_dim=2048, *, direct_residual=True, residual_only=False, point_to_plane=False, relative_geometry=False):
+    def __init__(self, token_dim=2048, *, direct_residual=True, residual_only=False, point_to_plane=False, relative_geometry=False, confidence_gate=False):
         super().__init__()
         self.token_project = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, 32), nn.GELU())
         # camera point, rendered point in T0 camera, metric residual, ray, O, var
@@ -295,6 +295,11 @@ class SpatialRefinement(nn.Module):
         self.residual_only = residual_only
         self.point_to_plane = point_to_plane
         self.relative_geometry = relative_geometry
+        self.confidence_gate = None
+        if confidence_gate:
+            self.confidence_gate = nn.Linear(64*4*5, 1)
+            nn.init.zeros_(self.confidence_gate.weight)
+            nn.init.constant_(self.confidence_gate.bias, -2.)
         self.residual_modulator = None
         if residual_only:
             self.residual_modulator = nn.Linear(64*4*5, 3*4*5)
@@ -351,5 +356,9 @@ class SpatialRefinement(nn.Module):
             if self.relative_geometry:
                 metric_depth = (rendered.depth.reshape(-1, 1)*opacity).sum()/opacity.sum().clamp_min(1e-6)
                 value = torch.cat((value[:6], value[6:]*metric_depth.clamp(.2, 10.)))
+            if self.confidence_gate is not None:
+                gate = self.confidence_gate(spatial).sigmoid()*opacity.mean()
+                identity = value.new_tensor([1., 0., 0., 0., 1., 0., 0., 0., 0.])
+                value = identity+gate*(value-identity)
             delta = delta @ pose_from_vector(value)
         return fixed @ delta, X_T0.reshape(height, width, 3), residual_world.reshape(height, width, 3)

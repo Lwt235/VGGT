@@ -44,11 +44,12 @@ def camera_facing_normals(covars, means, center):
 
 
 class RenderReader(nn.Module):
-    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False, camera_frame=False):
+    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False, camera_frame=False, local_multiplicative=False):
         super().__init__()
         self.latent_dim = latent_dim
         self.surface_normals = surface_normals
         self.camera_frame = camera_frame
+        self.local_multiplicative = local_multiplicative
         self.project = nn.Sequential(nn.Linear(latent_dim+(8 if camera_frame else 5), token_dim), nn.GELU(), nn.Linear(token_dim, token_dim))
         self.unseen = nn.Parameter(torch.zeros(token_dim))
         self.norm = nn.LayerNorm(token_dim)
@@ -57,7 +58,7 @@ class RenderReader(nn.Module):
         if metric_depth:
             self.depth_confidence = nn.Sequential(nn.Linear(latent_dim+4, 64), nn.GELU(), nn.Linear(64, 1))
             nn.init.zeros_(self.depth_confidence[-1].weight)
-            nn.init.zeros_(self.depth_confidence[-1].bias)
+            nn.init.constant_(self.depth_confidence[-1].bias, 1. if local_multiplicative else 0.)
 
     def calibrate_camera_scale(self, camera_points, rendered):
         """Map-only metric scale inside forward, with smooth unseen fallback.
@@ -97,6 +98,18 @@ class RenderReader(nn.Module):
             variance = rendered.depth_variance
             attrs = torch.cat((rendered.features, rendered.opacity, torch.log1p(variance), rendered.depth, native_depth), -1)
         confidence = self.depth_confidence(attrs).sigmoid()
+        if self.local_multiplicative:
+            # Each patch owns its ratio: no reduction over space. Upsample each
+            # 1x1 patch independently with bilinear interpolation, so erasure
+            # cannot change an adjacent patch or leak into an opacity=0 hole.
+            ratio = (rendered.depth/native_depth.clamp_min(.05)).clamp(.25, 4.)
+            reliable = confidence*rendered.opacity/(1+variance)*(native_depth > .05)
+            factor = reliable*(ratio-1)
+            if h % hp or w % wp:
+                raise ValueError('Local anchoring requires an integer patch grid')
+            tiles = F.interpolate(factor.reshape(hp*wp, 1, 1, 1), size=(h//hp, w//wp), mode='bilinear', align_corners=False)
+            scale = tiles.reshape(hp, wp, h//hp, w//wp).permute(0, 2, 1, 3).reshape(h, w)
+            return camera_points*(1+scale[..., None]), confidence
         correction = confidence*rendered.opacity/(1+variance)*(rendered.depth-native_depth)
         correction = F.interpolate(correction.permute(2, 0, 1)[None], size=(h, w), mode='bilinear', align_corners=False)[0, 0]
         from src.geometry import pixel_grid
