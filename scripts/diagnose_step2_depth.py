@@ -22,7 +22,42 @@ from src.geometry import patch_intrinsics, world_rays, ray_ellipsoid_distance
 
 
 @torch.no_grad()
-def evaluate_run(name, step):
+def bootstrap_case_diagnostic(out,query,target):
+    """Post-forward physics only. GT candidate is never returned to the model."""
+    from src.models.ellipsoid_pose import planar_safe_initial
+    points=out['camera_patch_points'].double().cpu()
+    anchors=out['anchors'].double().cpu()
+    covars=out['posterior_covars'].double().cpu()
+    weights=((1-out['dustbin_probability'])*out['c_depth']).double().cpu()
+    Rw,tw,scale,votes=planar_safe_initial(points,anchors,weights)
+    Rp,tp,_,_=planar_safe_initial(points,anchors,weights,whiten=False)
+    h,w=out['rendered'].depth.shape[:2]
+    _,rays,_=world_rays(patch_intrinsics(query.K).double().cpu(),torch.eye(4,dtype=torch.float64),h,w)
+    radial=(points*scale).norm(dim=-1);alpha=.04/(radial+.5).square()
+    precision=torch.linalg.inv(covars)
+    def energy(pose):
+        R,t=pose[:3,:3],pose[:3,3]
+        directions=rays@R.T;delta=anchors-t
+        Ad=torch.einsum('qij,qj->qi',precision,directions)
+        depth=((Ad*delta).sum(-1)+alpha*radial)/((Ad*directions).sum(-1)+alpha)
+        depth=depth.clamp_min(.05)
+        residual=t+depth[:,None]*directions-anchors
+        m2=torch.einsum('qi,qij,qj->q',residual,precision,residual)+alpha*(depth-radial).square()
+        return float((weights*9*torch.log1p(m2.clamp_min(0)/9)).sum())
+    candidates={}
+    for name,R,t in [('white',Rw,tw),('plain',Rp,tp)]:
+        pose=torch.eye(4,dtype=points.dtype);pose[:3,:3]=R;pose[:3,3]=t;candidates[name]=pose
+    candidates.update(final_T0=out['T0'].double().cpu(),gt_diagnostic_only=target.c2w.double().cpu())
+    rows={}
+    for name,pose in candidates.items():
+        rotation,translation=pose_errors(pose,target.c2w.double().cpu())
+        rows[name]=dict(rotation_error_deg=float(rotation),translation_error_m=float(translation),energy=energy(pose),
+                        orthogonality_error=float((pose[:3,:3].T@pose[:3,:3]-torch.eye(3)).abs().max()))
+    return dict(candidates=rows,robust_scatter_scale=float(scale),effective_initial_votes=float(votes.sum().square()/votes.square().sum().clamp_min(1e-12)))
+
+
+@torch.no_grad()
+def evaluate_run(name, step, *, case_folder=None):
     folder = PROJECT_ROOT/'results'/name
     config = yaml.safe_load((folder/'config.yaml').read_text())
     runtime = load_config()
@@ -37,14 +72,17 @@ def evaluate_run(name, step):
     dataset = EpisodeDataset(PROJECT_ROOT/config['split'], config['image_hw'])
     specs = [s for s in dataset.evaluation_episodes() if s['scene'].startswith('harvard_robotics_lab/')]
     buffers = {label:[] for label in ('near_0.1_3m', 'mid_3_5m', 'far_5_10m')}
-    scatter, poses, attention_stats, calibration_stats = [], [], [], []
+    scatter, poses, attention_stats, calibration_stats, case_vis = [], [], [], [], []
     for spec in specs:
         episode = dataset.episode(spec['scene'], spec['mapping_frame_ids'], spec['query_frame_id'], device='cuda')
         query, target = episode['query']
         memory = model.build_memory(episode['mapping'])
         out = model(query, memory, return_attention=True)
         if 'camera_scale' in out:
-            calibration_stats.append(dict(query=spec['query_frame_id'], gamma=float(out['camera_scale']), confidence_mean=float(out['local_geometry_confidence'].mean())))
+            visible=out['rendered_T1'].opacity[...,0]>.1
+            confidence=out['local_geometry_confidence'][...,0]
+            calibration_stats.append(dict(query=spec['query_frame_id'],gamma=float(out['camera_scale']),confidence_mean=float(confidence.mean()),
+                confidence_visible=float(confidence[visible].mean()) if visible.any() else None,visible_fraction=float(visible.float().mean())))
         info = out['attention']
         weights = info['attention']
         if weights is not None:
@@ -68,6 +106,17 @@ def evaluate_run(name, step):
         scatter.append(torch.stack((target.depth.flatten()[mask], raw.flatten()[mask], anchored.flatten()[mask]), -1).cpu().numpy())
         r0,t0 = pose_errors(out['T0'],target.c2w);r1,t1 = pose_errors(out['T1'],target.c2w)
         poses.append(dict(query=spec['query_frame_id'],rotation0_deg=float(r0),rotation1_deg=float(r1),translation0_m=float(t0),translation1_m=float(t1)))
+        if case_folder is not None and spec['query_frame_id']==362:
+            from scripts.train_step2 import intervention_box
+            from src.vis.step2 import unseen_visualizations
+            empty=model(query,memory.subset(slice(0,0)))
+            box=intervention_box(memory,target)
+            partial,mask=memory.erase_box(*box)
+            erased=model(query,partial)
+            wall,erasure=unseen_visualizations(model,episode,memory,out,empty,erased,box,mask,case_folder)
+            physics=bootstrap_case_diagnostic(out,query,target) if 'posterior_covars' in out else None
+            case_vis.append(dict(query=362,wall=wall,erasure=erasure,bootstrap_physics=physics))
+            del empty,partial,erased
         del out,memory,episode
     bins = {}
     for label, arrays in buffers.items():
@@ -76,7 +125,7 @@ def evaluate_run(name, step):
                            anchored_depth_bias_m=float(values[:,2].mean()), raw_depth_l1_m=float(np.abs(values[:,1]).mean()), anchored_depth_l1_m=float(np.abs(values[:,2]).mean()))
     del model
     torch.cuda.empty_cache()
-    return dict(pixel_weighted_depth_bins=bins,query_pose=poses,o6_attention=attention_stats,camera_calibration=calibration_stats), np.concatenate(scatter)
+    return dict(pixel_weighted_depth_bins=bins,query_pose=poses,o6_attention=attention_stats,camera_calibration=calibration_stats,case_visualizations=case_vis), np.concatenate(scatter)
 
 
 def main():
@@ -85,9 +134,10 @@ def main():
     if not os.environ.get('VGGT_GPU_MEMORY_FRACTION'): parser.error('Use live GPU launcher')
     torch.set_num_threads(2);torch.cuda.set_per_process_memory_fraction(float(os.environ['VGGT_GPU_MEMORY_FRACTION']))
     results, samples={},{}
+    output_folder=PROJECT_ROOT/'results'/args.new
     runs=[('full',args.old),('v2',args.middle),('v3',args.new)] if args.middle else [('old',args.old),('new',args.new)]
     for tag,name in runs:
-        results[tag],samples[tag]=evaluate_run(name,args.step)
+        results[tag],samples[tag]=evaluate_run(name,args.step,case_folder=output_folder/'vis'/f'step_{args.step:05d}'/'robotics_362_diagnostic' if args.middle and tag=='v3' else None)
     folder=PROJECT_ROOT/'results'/args.new
     dump_json(folder/f'robotics_depth_{args.step:05d}.json',results)
     fig,axes=plt.subplots(len(runs),2,figsize=(10,4.5*len(runs)),layout='constrained')
