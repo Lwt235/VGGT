@@ -214,6 +214,7 @@ def main():
     parser.add_argument('--run', required=True)
     parser.add_argument('--until', type=int, default=18000)
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--anomaly-step', type=int, help='Trace one failed update and save its preceding complete state; does not change the training configuration')
     parser.add_argument('--profile', type=int, default=0, help='Disposable run; no checkpoints/evaluations or warm start')
     args = parser.parse_args()
     config = yaml.safe_load((PROJECT_ROOT/args.config).read_text())
@@ -236,6 +237,8 @@ def main():
         parser.error('Profile must use a fresh disposable directory')
     if args.until > config['steps'] or args.until < 1 or args.profile < 0:
         parser.error('Invalid training budget')
+    if args.anomaly_step is not None and not 1 <= args.anomaly_step <= args.until:
+        parser.error('Anomaly update must fit the requested training endpoint')
     if not os.environ.get('VGGT_GPU_MEMORY_FRACTION'):
         parser.error('Use run_on_available_gpu.py for live resource selection')
     subprocess.run([sys.executable, '-B', '-m', 'pytest', 'tests', '-q'], cwd=PROJECT_ROOT,
@@ -277,6 +280,12 @@ def main():
     started = time.monotonic(); timings = []
     with (folder/'metrics.jsonl').open('a' if args.resume else 'w', buffering=1) as log:
         for step in range(start, until):
+            torch.autograd.set_detect_anomaly(step+1 == args.anomaly_step, check_nan=True)
+            if step+1 == args.anomaly_step and not args.profile:
+                # A failed backward must be reproducible from the exact state
+                # before its input/erasure RNG draws, without skipping a sample.
+                save_checkpoint(model, optimizer, scheduler, config, folder, step, weights)
+                print('Saved exact pre-anomaly state at', step, flush=True)
             tic = time.monotonic(); torch.cuda.reset_peak_memory_stats()
             spec = schedule[step]
             episode = dataset.episode(spec['scene'], spec['mapping_frame_ids'], spec['query_frame_id'], device='cuda')
