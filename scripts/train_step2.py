@@ -259,7 +259,18 @@ def main():
                 del partial
             norms = {name:gradient_norm(module) for name,module in modules.items()}
             state_norms = {n:float(v.grad.norm()) if v.grad is not None else 0. for n,v in zip(('mu', 'Sigma', 'alpha', 'z'), (memory.means,memory.covars,memory.alpha,memory.features))}
-            if not all(math.isfinite(x) for x in [*norms.values(), *state_norms.values()]): raise RuntimeError('Nonfinite gradients')
+            if not all(math.isfinite(x) for x in [*norms.values(), *state_norms.values()]):
+                # Failure-only diagnostics: do not change the forward/backward,
+                # optimizer, RNG, sample order, or numerical safety decision.
+                bad = [name for name,p in model.named_parameters()
+                       if p.grad is not None and not torch.isfinite(p.grad).all()]
+                dump_json(folder/f'nonfinite_gradient_{step+1:05d}.json', dict(
+                    step=step+1, scene=episode['name'], query_frame_id=episode['query_frame_id'],
+                    mapping_frame_ids=episode['mapping_frame_ids'], loss=metrics['loss'],
+                    module_norms={n:v if math.isfinite(v) else str(v) for n,v in norms.items()},
+                    memory_norms={n:v if math.isfinite(v) else str(v) for n,v in state_norms.items()},
+                    nonfinite_parameters=bad))
+                raise RuntimeError('Nonfinite gradients')
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], config['optimizer']['grad_clip'], error_if_nonfinite=True)
             optimizer.step(); scheduler.step(); torch.cuda.synchronize(); seconds = time.monotonic()-tic
             metrics.update(step=step+1, scene=episode['name'], query_frame_id=episode['query_frame_id'], mapping_frame_ids=episode['mapping_frame_ids'],
