@@ -313,7 +313,8 @@ def depth_bin_comparison(output, *, allow_incomplete=False, plot=True):
             ax.set(ylabel=key+' [m]')
             ax.grid(axis='y', alpha=.2)
         axes[0, 0].legend(fontsize=8)
-        fig.suptitle('11 fixed robotics queries / pooled valid pixels / no alignment; incomplete-preview fields are N/A, not zero')
+        status_label = 'complete six-way measurements' if complete else 'incomplete preview; missing fields are N/A'
+        fig.suptitle('11 fixed robotics queries / pooled valid pixels / no alignment; '+status_label)
         fig.savefig(output/'robotics_depth_bins_six_way.png', dpi=150)
         plt.close(fig)
     return dict(status='complete' if complete else 'incomplete', source=str(path), sha256=digest(path))
