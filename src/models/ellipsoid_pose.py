@@ -48,7 +48,7 @@ def posterior_ellipsoids(inlier, memory, *, sigma_floor=.03):
 
 def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4,
                           kappa=3., radial_precision=4., damping=.01,
-                          return_diagnostic=False):
+                          return_diagnostic=False, metric_scale=False):
     # Import locally: the legacy initialization remains available for restoring
     # older project runs, while the v2l update never uses Gram-Schmidt again.
     from src.models.spatial_pose import point_irls_pose
@@ -60,6 +60,16 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
                                             for x in (points, rays, anchors, covars, weights)]
     rays = F.normalize(rays, dim=-1)
     precision = torch.linalg.inv(covars)
+    scatter_scale = points.new_ones(())
+    if metric_scale:
+        normalized = weights/weights.sum().clamp_min(1e-8)
+        def scatter(value):
+            centered = value-(normalized[:, None]*value).sum(0)
+            return (normalized*centered.square().sum(-1)).sum()
+        scatter_scale = (scatter(anchors)/scatter(points).clamp_min(1e-6)).clamp_min(1e-12).sqrt().clamp(.25, 4.)
+        points = scatter_scale*points
+    radial = points.norm(dim=-1)
+    alpha = .04/(radial+.5).square() if metric_scale else torch.full_like(radial, radial_precision)
     initial, _ = point_irls_pose(points, anchors, weights, iterations=0)
     R, t = initial[:3, :3], initial[:3, 3]
     radial = points.norm(dim=-1)
@@ -69,11 +79,11 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
         direction = rays @ rotation.T
         delta = anchors-center
         Ad = torch.einsum('qij,qj->qi', precision, direction)
-        depth = ((Ad*delta).sum(-1)+radial_precision*radial)/((Ad*direction).sum(-1)+radial_precision)
+        depth = ((Ad*delta).sum(-1)+alpha*radial)/((Ad*direction).sum(-1)+alpha)
         depth = depth.clamp_min(.05)
         residual = center+depth[:, None]*direction-anchors
         m2 = torch.einsum('qi,qij,qj->q', residual, precision, residual)
-        m2 = m2+radial_precision*(depth-radial).square()
+        m2 = m2+alpha*(depth-radial).square()
         m2 = m2.clamp_min(0)
         energy = (weights*kappa**2*torch.log1p(m2/kappa**2)).sum()
         return depth, residual, m2, energy
@@ -82,11 +92,11 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
     # centroid prior. Accept only when the SAME robust energy does not rise.
     direction = rays @ R.T
     Ad = torch.einsum('qij,qj->qi', precision, direction)
-    denominator = (Ad*direction).sum(-1)+radial_precision
+    denominator = (Ad*direction).sum(-1)+alpha
     W = precision-Ad[:, :, None]*Ad[:, None, :]/denominator[:, None, None]
     A = (weights[:, None, None]*W).sum(0)
     b = (weights[:, None]*(torch.einsum('qij,qj->qi', W, anchors)
-                          -radial_precision*radial[:, None]*Ad/denominator[:, None])).sum(0)
+                          -alpha[:, None]*radial[:, None]*Ad/denominator[:, None])).sum(0)
     regularizer = 1e-4*A.trace()/3+1e-8
     candidate = torch.linalg.solve(A+regularizer*eye3, b+regularizer*t)
     old_energy = state(R, t)[-1]
@@ -99,7 +109,7 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
         psi = kappa**2/(kappa**2+m2)
         robust = weights*psi
         local_precision = R.T[None] @ precision @ R[None]
-        B = local_precision+radial_precision*rays[:, :, None]*rays[:, None, :]
+        B = local_precision+alpha[:, None, None]*rays[:, :, None]*rays[:, None, :]
         r_loc = residual @ R
         J = torch.cat((-skew(depth[:, None]*rays), eye3.expand(len(points), -1, -1)), -1)
         # Schur-eliminate the same nuisance ray depth in the normal equations.
@@ -136,5 +146,5 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
     if return_diagnostic:
         return T, robust.to(device=output_device, dtype=dtype), dict(energy_history=torch.stack(history),
             accepted_scales=torch.stack(scales) if scales else points.new_empty(0),
-            mahalanobis2=m2, ray_depth=depth)
+            mahalanobis2=m2, ray_depth=depth, scatter_scale=scatter_scale.detach(), radial_precision=alpha.detach())
     return T, robust.to(device=output_device, dtype=dtype)

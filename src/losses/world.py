@@ -1,4 +1,4 @@
-"""World metric supervision only: no fitting, centering, relative-depth loss."""
+"""Unaligned world metric supervision with optional relative depth auxiliary."""
 
 import math
 import torch
@@ -140,7 +140,7 @@ def open_set_matching_loss(output, target, erased_reference=None):
     return match, anchor, support_rate, observable
 
 
-def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2, depth_weight=1.):
+def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2, depth_weight=1., relative_depth_weight=0.):
     if 'matching_attention' not in output:
         return _legacy_world_loss(output, target, camera_weight=camera_weight, refinement_safety_weight=refinement_safety_weight,
                                   anchor_weight=anchor_weight, matching_weight=matching_weight)
@@ -154,13 +154,16 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
     mask = fraction > .25
     depth_error = (output['z_cam'][mask]-depth[mask]).abs()
     z_loss = depth_error.mean()
+    relative_z = (depth_error/depth[mask].clamp_min(.2)).mean()
     confidence_loss = F.binary_cross_entropy(output['c_depth'][mask].clamp(1e-6, 1-1e-6), torch.exp(-depth_error.detach()/.5))
     camera_truth = transform_points(target.world_points, invert_se3(target.c2w))
     camera_delta = output.get('raw_camera_points', output['camera_points'])[target.valid]-camera_truth[target.valid]
     # No random-world pose/point/anchor loss on the unobservable frame.
     loss = base+anchor_weight*anchor if observable else camera_weight*camera_delta.abs().mean()
     loss = loss+matching_weight*match+depth_weight*(z_loss+.05*confidence_loss)
-    metrics.update(loss=float(loss.detach()), anchor_l1_m=float(anchor.detach()), correspondence_loss=float(match.detach()),
+    relative_camera = (camera_delta[:, 2].abs()/camera_truth[target.valid][:, 2].clamp_min(.2)).mean()
+    loss = loss+relative_depth_weight*(relative_z+relative_camera)
+    metrics.update(relative_depth_l1=float(relative_z.detach()), relative_camera_depth_l1=float(relative_camera.detach()), loss=float(loss.detach()), anchor_l1_m=float(anchor.detach()), correspondence_loss=float(match.detach()),
                    surface_support_rate=float(support_rate), world_supervision_enabled=float(observable),
                    z_cam_l1_m=float(z_loss.detach()), camera_epe_m=float(camera_delta.detach().norm(dim=-1).mean()),
                    dustbin_mean=float(output['dustbin_probability'].detach().mean()),

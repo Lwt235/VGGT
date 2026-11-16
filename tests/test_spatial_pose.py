@@ -289,7 +289,7 @@ def test_v2k_spatial_geometry_adaptive_dustbin_and_gauge_independence():
     torch.testing.assert_close(rejected, torch.eye(4), atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.parametrize('revision', ['v2k', 'v2l'])
+@pytest.mark.parametrize('revision', ['v2k', 'v2l', 'step2_v2'])
 def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeypatch, revision):
     from types import SimpleNamespace
     from torch import nn
@@ -310,7 +310,12 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
         def forward(self, tokens, *args):
             self.seen_pose = args[1]
             return tokens, rendered
+        def render(self, memory, pose, *args):
+            self.final_pose = pose
+            return rendered
         def anchor_camera_geometry(self, points, *args):
+            if revision == 'step2_v2':
+                assert hasattr(self, 'final_pose')
             return points+1, torch.ones(2, 3, 1)
     class PE(nn.Module):
         def forward(self, tokens, *args, **kwargs):
@@ -340,7 +345,7 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
     assert prediction['raw_camera_points'].data_ptr() == raw.data_ptr()
     torch.testing.assert_close(prediction['camera_points'], raw+1)
     torch.testing.assert_close(prediction['world_points'], raw+1)
-    if revision=='v2l':
+    if revision in ('v2l', 'step2_v2'):
         from src.models.ellipsoid_pose import sample_read_jitter
         jitter = sample_read_jitter('cpu')
         noisy = model(query, memory, read_jitter=jitter)

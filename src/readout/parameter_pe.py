@@ -4,7 +4,7 @@ import math
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-from src.geometry import ray_ellipsoid_distance, transform_points, world_rays
+from src.geometry import ray_ellipsoid_distance, transform_points, world_rays, invert_se3
 from src.memory.gaussians import GaussianMemory
 
 
@@ -41,12 +41,13 @@ def active_memory(memory, query_c2w, K, height, width, *, budget=2048, margin=.2
 
 
 class ParameterPEReader(nn.Module):
-    def __init__(self, token_dim=1024, latent_dim=256, heads=8, bands=8, *, opacity_occlusion=True):
+    def __init__(self, token_dim=1024, latent_dim=256, heads=8, bands=8, *, opacity_occlusion=True, camera_frame=False):
         super().__init__()
         if token_dim % heads:
             raise ValueError("token_dim must divide heads")
         self.heads, self.bands = heads, bands
         self.opacity_occlusion = opacity_occlusion
+        self.camera_frame = camera_frame
         self.query = nn.Linear(token_dim, token_dim)
         self.query_geometry = nn.Linear(6*bands+6, token_dim, bias=False)
         self.key = nn.Linear(latent_dim+6*bands, token_dim)
@@ -67,22 +68,31 @@ class ParameterPEReader(nn.Module):
         nquery, channels = tokens.shape
         head_dim = channels//self.heads
         origins, directions, camera_dz = world_rays(K_patch, query_c2w, height, width)
-        eigenvalues, eigenvectors = torch.linalg.eigh(selected.covars)
+        means, covars = selected.means, selected.covars
+        rendered_world = rendered.world if rendered is not None else None
+        if self.camera_frame:
+            w2c = invert_se3(query_c2w)
+            means = transform_points(means, w2c)
+            covars = w2c[:3, :3] @ covars @ w2c[:3, :3].T
+            origins, directions, camera_dz = world_rays(K_patch, torch.eye(4, device=tokens.device, dtype=tokens.dtype), height, width)
+            if rendered is not None:
+                rendered_world = transform_points(rendered.world, w2c)
+        eigenvalues, eigenvectors = torch.linalg.eigh(covars)
         log_scales = eigenvalues.clamp_min(1e-10).sqrt().log()
         normals = eigenvectors[..., 0]
         position = tokens.new_zeros(nquery, 6*self.bands)
         if rendered is not None:
-            position = center_pe(rendered.world.reshape(-1, 3), self.bands)*rendered.opacity.reshape(-1, 1)
+            position = center_pe(rendered_world.reshape(-1, 3), self.bands)*rendered.opacity.reshape(-1, 1)
         ray_geometry = torch.cat((position, directions, origins/5.), -1)
         q = (self.query(tokens)+self.query_geometry(ray_geometry)).reshape(nquery, self.heads, head_dim)
-        k = self.key(torch.cat((selected.features, center_pe(selected.means, self.bands)), -1))
+        k = self.key(torch.cat((selected.features, center_pe(means, self.bands)), -1))
         k = k.reshape(len(selected), self.heads, head_dim)
         v = self.value(selected.features).reshape(len(selected), self.heads, head_dim)
         chunks, attention = [], []
         for start in range(0, nquery, query_chunk):
             stop = min(start+query_chunk, nquery)
             rho2, t = ray_ellipsoid_distance(origins[start:stop], directions[start:stop],
-                                             selected.means, selected.covars)
+                                             means, covars)
             closest_z = t*camera_dz[start:stop, None]
             relative_z = closest_z-render_depth.reshape(-1)[start:stop, None]
             if rendered is not None and self.opacity_occlusion:

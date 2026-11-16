@@ -60,7 +60,7 @@ def build_optimizer(model, config):
 def criterion(output, target, config):
     return world_loss(output, target, camera_weight=config['camera_alignment_weight'],
         refinement_safety_weight=config['refinement_safety_weight'], anchor_weight=config['anchor_alignment_weight'],
-        matching_weight=config['matching_weight'], depth_weight=config['patch_depth_weight'])
+        matching_weight=config['matching_weight'], depth_weight=config['patch_depth_weight'], relative_depth_weight=config.get('relative_depth_weight', 0.))
 
 
 def intervention_box(memory, target):
@@ -192,7 +192,7 @@ def main():
     dataset = EpisodeDataset(PROJECT_ROOT/config['split'], config['image_hw'])
     runtime = load_config(); weights = runtime['assets']['vggt_weights']['path']
     print('FRESH official VGGT/DINOv2/DPT only:', weights, flush=True)
-    model = VGGTSpatialMemory(runtime['assets']['official_vggt_source']['path'], weights, revision='step2',
+    model = VGGTSpatialMemory(runtime['assets']['official_vggt_source']['path'], weights, revision=config['architecture_revision'],
                               receive_layer=config['receive_layer'], pose_jitter_probability=0.).cuda().train()
     optimizer, scheduler = build_optimizer(model, config)
     start = 0

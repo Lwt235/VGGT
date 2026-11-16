@@ -1,0 +1,36 @@
+seed: 17
+architecture_revision: step2_v2
+initialization: official_vggt_only_no_smoke_checkpoint
+split: configs/step2_splits.yaml
+steps: 18000
+midpoint_steps: 3000
+image_hw: [168, 224]
+receive_layer: 4
+downstream_trainable_global_block: 11
+camera_alignment_weight: 0.2
+patch_depth_weight: 2.0
+relative_depth_weight: 0.2
+anchor_alignment_weight: 1.0
+matching_weight: 1.0
+refinement_safety_weight: 2.0
+mapping_self_observation: true
+read_jitter_probability: 0.5
+paired_pose_consistency: true
+paired_erasure_radius_m: [0.6, 0.75]
+optimizer:
+  heads_lr: 0.0003
+  pose_lr: 0.0002
+  bootstrap_lr: 0.0003
+  dustbin_lr: 0.005
+  dustbin_head_lr: 0.0005
+  gate_lr: 0.001
+  refinement_geometry_lr: 0.0002
+  native_lr: 0.000003
+  warmup_steps: 200
+  end_lr_ratio: 0.1
+  grad_clip: 5.0
+log_every: 50
+checkpoint_every: 500
+full_eval_steps: [0, 1500, 3000, 18000]
+quick_eval_every: 500
+description: Camera-frame reads, metric scatter initialization and weak relative radial prior, final T1 raster anchoring. Fresh official VGGT, frozen DINO, full token memory with normals/point-to-plane refinement; strict disjoint scenes and dynamic covisible multi-frame maps. Inspect Step2a at 3000 before continuing.

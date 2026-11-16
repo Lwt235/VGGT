@@ -44,11 +44,12 @@ def camera_facing_normals(covars, means, center):
 
 
 class RenderReader(nn.Module):
-    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False):
+    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False, camera_frame=False):
         super().__init__()
         self.latent_dim = latent_dim
         self.surface_normals = surface_normals
-        self.project = nn.Sequential(nn.Linear(latent_dim+5, token_dim), nn.GELU(), nn.Linear(token_dim, token_dim))
+        self.camera_frame = camera_frame
+        self.project = nn.Sequential(nn.Linear(latent_dim+(8 if camera_frame else 5), token_dim), nn.GELU(), nn.Linear(token_dim, token_dim))
         self.unseen = nn.Parameter(torch.zeros(token_dim))
         self.norm = nn.LayerNorm(token_dim)
         self.gate = nn.Parameter(torch.zeros(token_dim))
@@ -69,9 +70,16 @@ class RenderReader(nn.Module):
         hp, wp = rendered.depth.shape[:2]
         h, w = camera_points.shape[:2]
         native_depth = F.adaptive_avg_pool2d(camera_points[..., 2][None, None], (hp, wp))[0, 0, ..., None]
-        attrs = torch.cat((rendered.features, rendered.opacity, torch.log1p(rendered.depth_variance), rendered.depth, native_depth), -1)
+        if self.camera_frame:
+            variance = rendered.depth_variance/rendered.depth.square().clamp_min(.04)
+            attrs = torch.cat((rendered.features, rendered.opacity, torch.log1p(variance),
+                               torch.log1p(rendered.depth),
+                               (rendered.depth-native_depth)/rendered.depth.clamp_min(.2)), -1)
+        else:
+            variance = rendered.depth_variance
+            attrs = torch.cat((rendered.features, rendered.opacity, torch.log1p(variance), rendered.depth, native_depth), -1)
         confidence = self.depth_confidence(attrs).sigmoid()
-        correction = confidence*rendered.opacity/(1+rendered.depth_variance)*(rendered.depth-native_depth)
+        correction = confidence*rendered.opacity/(1+variance)*(rendered.depth-native_depth)
         correction = F.interpolate(correction.permute(2, 0, 1)[None], size=(h, w), mode='bilinear', align_corners=False)[0, 0]
         from src.geometry import pixel_grid
         grid = pixel_grid(h, w, device=K_cv.device, dtype=K_cv.dtype, center=0.)
@@ -106,7 +114,14 @@ class RenderReader(nn.Module):
         rendered = self.render(memory, query_c2w, K_patch, height, width)
         attributes = torch.cat((rendered.world, rendered.features,
                                 rendered.depth, rendered.depth_variance), -1)
-        visible = self.project(attributes.reshape(-1, self.latent_dim+5))
+        if self.camera_frame:
+            w2c = invert_se3(query_c2w)
+            camera = transform_points(rendered.world, w2c)
+            camera = torch.where(rendered.opacity > 1e-6, camera, 0.)
+            normal = rendered.normal @ w2c[:3, :3].T
+            attributes = torch.cat((camera, normal, rendered.features, torch.log1p(rendered.depth),
+                rendered.depth_variance/(rendered.depth.square()+.05)), -1)
+        visible = self.project(attributes.reshape(-1, self.project[0].in_features))
         opacity = rendered.opacity.reshape(-1, 1)
         received = opacity*visible + (1-opacity)*self.unseen
         return tokens + torch.tanh(self.gate)*self.norm(received), rendered
