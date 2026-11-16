@@ -98,8 +98,8 @@ def main():
     if len(schedule)<required:parser.error('Full episode schedule is incomplete')
     reference_path=source/f"evaluation_{config['steps']:05d}_full.json"
     if not args.profile and not reference_path.exists():parser.error('Full must finish before Local main training')
-    # Profile may use the existing 3000-step grouping; main always uses final Full.
-    if args.profile and not reference_path.exists():reference_path=source/'evaluation_03000_full.json'
+    # Profile has no evaluation; an existing initial grouping is sufficient. Main always uses final Full.
+    if args.profile and not reference_path.exists():reference_path=source/'evaluation_00000_full.json'
     reference_data=json.loads(reference_path.read_text());reference={(r['scene'],r['query_frame_id']):r for r in reference_data['episodes']}
     subprocess.run([sys.executable,'-B','-m','pytest','tests','-q'],cwd=PROJECT_ROOT,env=dict(os.environ,REQUIRE_GSPLAT='1'),check=True)
     torch.set_num_threads(2);random.seed(config['seed']);np.random.seed(config['seed']);torch.manual_seed(config['seed']);torch.cuda.manual_seed_all(config['seed'])
