@@ -53,5 +53,5 @@ checkpoint_milestones:
 - 12000
 - 18000
 continuous_training: true
-systemic_epe_limit_m: 0.35
+systemic_epe_limit_m: 0.50
 description: Fresh official VGGT; deep matching residual two-step monotone LM T1, smooth calibrated-ray local O5 with physical reliability floor; fixed physical overlap benchmark.

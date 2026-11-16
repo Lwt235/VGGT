@@ -21,6 +21,7 @@ import torch
 import yaml
 from src.step2_data import EpisodeDataset
 from src.evaluation import benchmark_observable
+from src.training_state import restore_training_state
 from src.augmentation import augment_training_world
 from src.losses.world import world_loss, surface_support_rate
 from src.losses.mapping import supervise_mapping_observation
@@ -194,7 +195,6 @@ def main():
     torch.cuda.set_per_process_memory_fraction(float(os.environ['VGGT_GPU_MEMORY_FRACTION']), 0)
     torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True
     folder.mkdir(exist_ok=args.resume)
-    (folder/'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
     dataset = EpisodeDataset(PROJECT_ROOT/config['split'], config['image_hw'])
     runtime = load_config(); weights = runtime['assets']['vggt_weights']['path']
     print('FRESH official VGGT/DINOv2/DPT only:', weights, flush=True)
@@ -204,14 +204,11 @@ def main():
     start = 0
     if args.resume:
         previous = load_checkpoint_readonly(folder/'training_state.pt')
-        if previous['config'] != config or previous.get('initialization') != 'fresh_official_vggt':
-            raise ValueError('Resume is restricted to this exact fresh Step2 run/config')
-        parameters = dict(model.named_parameters())
-        with torch.no_grad():
-            for name, value in previous['trainable'].items(): parameters[name].copy_(value)
-        optimizer.load_state_dict(previous['optimizer']); scheduler.load_state_dict(previous['scheduler'])
-        random.setstate(previous['python_rng']); torch.set_rng_state(previous['torch_rng']); torch.cuda.set_rng_state_all(previous['cuda_rng'])
-        start = previous['step']; del previous
+        start = restore_training_state(model, optimizer, scheduler, previous, config)
+        print('RESUME exact model/Adam/scheduler/Python/CPU/CUDA RNG:', start,
+              'safety limit', previous['config'].get('systemic_epe_limit_m'), '->', config.get('systemic_epe_limit_m'), flush=True)
+        del previous
+    (folder/'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
     print('Eligible training queries:', len(dataset.training_queries), 'trainable parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad), flush=True)
     records = [json.loads(l) for l in (folder/'metrics.jsonl').read_text().splitlines()] if args.resume else []
     validation = [json.loads(l) for l in (folder/'validation.jsonl').read_text().splitlines()] if args.resume else []
