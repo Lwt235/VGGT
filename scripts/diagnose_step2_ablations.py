@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live-launcher GPU diagnostics for new Step2b models; old caches are read-only.
+"""Live-launcher six-way diagnostics; all 18k source checkpoints stay read-only.
 
 Produces 11-robotics-query pixel depth bins and Full-weight, unfused Single V2.
 All outputs live under results/step2b_matrix_seed17. No query GT enters forward.
@@ -16,12 +16,15 @@ import numpy as np
 import torch
 import yaml
 from scripts.compare_step2_ablations import (OUTPUT, TAGS, VARIANTS, SCENES, make_parser,
-    roots_from_args, read_json, write_json, digest, identities, validate_episodes)
+    roots_from_args, read_json, write_json, digest, identities, validate_episodes, validate_depth_bins)
 from scripts.diagnose_step2_final import single_frame_unfused
 from src.models.vggt_memory import VGGTSpatialMemory
+from src.models.nomemory_vggt import VGGTNoMemory
 from src.step2_data import EpisodeDataset
 
 DEPTH_BINS = {'near_0.1_3m': (.1, 3.), 'mid_3_5m': (3., 5.), 'far_5_10m': (5., 10.)}
+CACHE_NAMES = {'Full': 'full', 'No-Memory': 'no_memory', 'Single-map': 'single_map_depth', **VARIANTS}
+DEPTH_TASKS = ('Full', 'No-Memory', 'Single-map-depth', *VARIANTS)
 
 
 def accumulate_bins(output, target, bins):
@@ -62,26 +65,32 @@ def summarize_bins(bins):
     return result
 
 
-def checkpoint_metadata(root, config, specs):
+def checkpoint_metadata(root, config, specs, *, tag=None):
     checkpoint = root/'training_state_18000.pt'
     stat = checkpoint.stat()
     import hashlib, json
-    return dict(run_name=root.name, step=18000, checkpoint_size=stat.st_size,
+    metadata = dict(run_name=root.name, step=18000, checkpoint_size=stat.st_size,
         checkpoint_mtime_ns=stat.st_mtime_ns, config_sha256=digest(root/'config.yaml'),
         split_sha256=digest(PROJECT_ROOT/config['split']), image_hw=config['image_hw'],
         architecture_revision=config['architecture_revision'], ablation=config.get('ablation'),
         episode_specs_sha256=hashlib.sha256(json.dumps(specs, sort_keys=True).encode()).hexdigest())
+    if tag is not None:
+        metadata.update(diagnostic_schema_version=2, method=tag,
+            mapping_mode=('none' if tag == 'No-Memory' else
+                          'first_frame_unfused' if tag == 'Single-map' else 'all_frames_fused'))
+    return metadata
 
 
 @torch.no_grad()
-def load_memory_model(root, config, assets):
+def load_memory_model(root, config, assets, *, no_memory=False):
     state = load_checkpoint_readonly(root/'training_state_18000.pt')
     if state['step'] != 18000 or state['config'] != config:
         raise ValueError('Final checkpoint/config mismatch: '+root.name)
-    model = VGGTSpatialMemory(source=assets['official_vggt_source']['path'],
-        weights=assets['vggt_weights']['path'], revision=config['architecture_revision'],
-        receive_layer=config['receive_layer'], pose_jitter_probability=0.,
-        ablation=config.get('ablation')).cuda().eval()
+    kwargs = dict(source=assets['official_vggt_source']['path'],
+                  weights=assets['vggt_weights']['path'], receive_layer=config['receive_layer'])
+    model = (VGGTNoMemory(**kwargs) if no_memory else VGGTSpatialMemory(**kwargs,
+        revision=config['architecture_revision'], pose_jitter_probability=0.,
+        ablation=config.get('ablation'))).cuda().eval()
     params = dict(model.named_parameters())
     expected = {name for name, value in params.items() if value.requires_grad}
     if set(state['trainable']) != expected:
@@ -93,40 +102,84 @@ def load_memory_model(root, config, assets):
     return model
 
 
+def predict_episode(model, episode, tag):
+    """Only the branch's permitted query/map inputs enter its prediction."""
+    query = episode['query'][0]
+    if tag == 'No-Memory':
+        return model(query)
+    if tag == 'Single-map':
+        memory = single_frame_unfused(model, episode['mapping'][0])
+    elif tag in TAGS:
+        memory = model.build_memory(episode['mapping'])
+    else:
+        raise ValueError('Unknown diagnostic method: '+tag)
+    return model(query, memory)
+
+
+def cache_path(tag):
+    return OUTPUT/'diagnostics'/(CACHE_NAMES[tag]+'.json')
+
+
+def read_matching_cache(path, metadata, tag, specs):
+    """Reuse only a complete same-method checkpoint/protocol measurement."""
+    if not path.exists():
+        return None
+    try:
+        cache = read_json(path)
+        robotics = [s for s in specs if s['scene'].startswith('harvard_robotics_lab/')]
+        if cache['metadata'] != metadata or identities(cache['episodes']) != identities(robotics):
+            return None
+        validate_depth_bins({tag:cache['robotics_depth_bins']}, required_tags=(tag,))
+        for label in DEPTH_BINS:
+            if sum(r['valid_pixels_by_bin'][label] for r in cache['episodes']) != cache['robotics_depth_bins'][label]['valid_pixels']:
+                return None
+        return cache
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 @torch.no_grad()
 def evaluate_variant(tag, root, dataset, specs, assets):
+    """Measure one of all six methods, including read-only legacy weights."""
     config = yaml.safe_load((root/'config.yaml').read_text())
-    if config.get('ablation') != VARIANTS[tag]:
+    if tag in VARIANTS and config.get('ablation') != VARIANTS[tag]:
         raise ValueError('Unexpected ablation model: '+tag)
-    metadata = checkpoint_metadata(root, config, specs)
-    destination = OUTPUT/'diagnostics'/(VARIANTS[tag]+'.json')
-    if destination.exists():
-        cache = read_json(destination)
-        if cache['metadata'] == metadata:
-            print('Reuse matching new diagnostic:', tag, flush=True)
-            return cache
+    if tag in ('Full', 'Single-map') and (config.get('ablation') is not None or config['architecture_revision'] != 'step2_v5'):
+        raise ValueError('Full/Single-map requires the original Full v5 weights')
+    if tag == 'No-Memory' and (config.get('ablation') is not None or config['architecture_revision'] != 'single_frame_nomemory'):
+        raise ValueError('No-Memory requires its own single-frame weights')
+    metadata = checkpoint_metadata(root, config, specs, tag=tag)
+    destination = cache_path(tag)
+    cache = read_matching_cache(destination, metadata, tag, specs)
+    if cache is not None:
+        print('Reuse matching measured diagnostic:', tag, flush=True)
+        return cache
     robotics = [s for s in specs if s['scene'].startswith('harvard_robotics_lab/')]
     if len(robotics) != 11:
         raise ValueError('Expected the original 11 robotics query specifications')
-    model = load_memory_model(root, config, assets)
+    model = load_memory_model(root, config, assets, no_memory=tag == 'No-Memory')
     bins = {label:[] for label in DEPTH_BINS}
     records = []
     for index, spec in enumerate(robotics):
         episode = dataset.episode(spec['scene'], spec['mapping_frame_ids'], spec['query_frame_id'], device='cuda')
-        query, target = episode['query']
-        memory = model.build_memory(episode['mapping'])
-        # Only query RGB/K and permitted map memory enter model forward.
-        output = model(query, memory)
+        output = predict_episode(model, episode, tag)
+        # Query GT is read only after the forward, for masks and errors.
+        target = episode['query'][1]
         counts = accumulate_bins(output, target, bins)
         records.append(dict(**spec, valid_pixels_by_bin=counts))
-        del output, memory, episode
+        del output, episode
         print(tag, 'robotics', index+1, '/', len(robotics), flush=True)
     del model
     torch.cuda.empty_cache()
     result = dict(metadata=metadata, pixel_aggregation='All valid pixels pooled over the fixed 11 queries',
         depth_bin_reference='GT camera z for evaluation masks only; never forwarded',
         alignment='none', query_inputs=['rgb', 'K'], episodes=records, robotics_depth_bins=summarize_bins(bins))
-    write_json(destination, result)
+    validate_depth_bins({tag:result['robotics_depth_bins']}, required_tags=(tag,))
+    # Atomic files also permit independent bounded GPU jobs to merge caches.
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(f'.{os.getpid()}.tmp')
+    write_json(temporary, result)
+    os.replace(temporary, destination)
     return result
 
 
@@ -159,11 +212,31 @@ def single_map_v2(root, dataset, specs, assets):
         description='First permitted map RGB-D only, shared writer/context, no fusion; no query forward or alignment', episodes=records))
 
 
+def collect_cached_diagnostics(roots, specs):
+    """Merge only new complete same-method measurements; never old partial bins."""
+    result, sources = {}, {}
+    for tag in TAGS:
+        root = roots[tag]
+        path = cache_path(tag)
+        if not path.is_file() or not (root/'config.yaml').is_file() or not (root/'training_state_18000.pt').is_file():
+            continue
+        config = yaml.safe_load((root/'config.yaml').read_text())
+        metadata = checkpoint_metadata(root, config, specs, tag=tag)
+        cache = read_matching_cache(path, metadata, tag, specs)
+        if cache is not None:
+            result[tag] = cache['robotics_depth_bins']
+            sources[tag] = dict(**metadata, cache=str(path), cache_sha256=digest(path))
+    if len(result) == len(TAGS):
+        validate_depth_bins(result)
+    return result, sources
+
+
 def main():
     parser = make_parser(comparison=False)
     parser.description = __doc__
-    parser.add_argument('--only', nargs='+', choices=[*VARIANTS, 'Single-map'],
-                        default=[*VARIANTS, 'Single-map'], help='Bounded diagnostic jobs; existing matching caches reused')
+    parser.add_argument('--only', nargs='+', choices=[*DEPTH_TASKS, 'Single-map'],
+                        default=[*DEPTH_TASKS, 'Single-map'],
+                        help='Bounded jobs: Single-map generates V2 only; Single-map-depth measures bins; matching caches reused')
     args = parser.parse_args()
     if not os.environ.get('VGGT_GPU_MEMORY_FRACTION'):
         parser.error('Use scripts/run_on_available_gpu.py for live GPU selection')
@@ -183,36 +256,24 @@ def main():
     if identities(dataset.evaluation_episodes()) != identities(specs):
         raise ValueError('Current dataset fixed evaluation differs from original Full final protocol')
     assets = load_config()['assets']
-    old_path = roots['Full']/'final_comparison/robotics_depth_bins.json'
-    old = read_json(old_path)
-    if set(old) != {'Full', 'No-Memory', 'Single-map'}:
-        raise ValueError('Unexpected historical diagnostic cache')
-    result = {tag:old[tag] for tag in TAGS[:3]}
-    sources = {tag:dict(source=str(old_path), sha256=digest(old_path), reuse='read-only historical cache',
-                       absent_fields='N/A; historical missing fields are never inferred') for tag in result}
-    for tag in args.only:
-        if tag == 'Single-map':
+    for task in args.only:
+        if task == 'Single-map':
             single_map_v2(roots['Full'], dataset, specs, assets)
             continue
+        tag = 'Single-map' if task == 'Single-map-depth' else task
         variant_config = yaml.safe_load((roots[tag]/'config.yaml').read_text())
         if variant_config['image_hw'] != config['image_hw'] or digest(PROJECT_ROOT/variant_config['split']) != digest(PROJECT_ROOT/config['split']):
             raise ValueError('Diagnostic split/resolution changed: '+tag)
         validate_episodes(read_json(roots[tag]/'evaluation_18000_full.json'), sequences, reference=specs)
-        diagnostic = evaluate_variant(tag, roots[tag], dataset, specs, assets)
-        result[tag] = diagnostic['robotics_depth_bins']
-        sources[tag] = diagnostic['metadata']
-    # Also include completed caches from separately launched bounded jobs.
-    for tag, variant in VARIANTS.items():
-        path = OUTPUT/'diagnostics'/(variant+'.json')
-        if tag not in result and path.exists():
-            cfg = yaml.safe_load((roots[tag]/'config.yaml').read_text())
-            cache = read_json(path)
-            if cache['metadata'] == checkpoint_metadata(roots[tag], cfg, specs):
-                result[tag] = cache['robotics_depth_bins']
-                sources[tag] = cache['metadata']
-    write_json(OUTPUT/'robotics_depth_bins.json', dict(protocol=dict(robotics_queries=11,
-        depth_bins=DEPTH_BINS, alignment='none', old_missing_metrics='N/A'), sources=sources,
-        status='complete' if len(result) == 6 else 'incomplete', robotics_depth_bins=result))
+        evaluate_variant(tag, roots[tag], dataset, specs, assets)
+    result, sources = collect_cached_diagnostics(roots, specs)
+    merged = OUTPUT/'robotics_depth_bins.json'
+    temporary = merged.with_suffix(f'.{os.getpid()}.tmp')
+    write_json(temporary, dict(protocol=dict(robotics_queries=11, depth_bins=DEPTH_BINS,
+        alignment='none', source='Read-only 18k checkpoint forwards for all six methods',
+        missing_metrics='Permitted only in explicitly incomplete previews'), sources=sources,
+        status='complete' if len(result) == len(TAGS) else 'incomplete', robotics_depth_bins=result))
+    os.replace(temporary, merged)
     print('Diagnostics saved:', OUTPUT, flush=True)
 
 

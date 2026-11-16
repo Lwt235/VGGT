@@ -18,7 +18,7 @@ PE-Only最终相机点严格为raw DPT点，移除锚定专属的额外相机/�
 
 ## 已完成验证
 
-`REQUIRE_GSPLAT=1`全部严格测试127项通过。覆盖关闭分支禁止调用、PE无O5的criterion/反传、球Writer/融合/后验严格标量单位阵、无eigh/法向泄露、有限梯度、默认Full兼容、数据重放和调度互斥。
+训练前`REQUIRE_GSPLAT=1`全部严格测试127项通过；补充六方深度统计后当前全部138项通过。覆盖关闭分支禁止调用、PE无O5的criterion/反传、球Writer/融合/后验严格标量单位阵、无eigh/法向泄露、有限梯度、默认Full兼容、数据重放、调度互斥及六方分桶统计完整性。
 
 三个真实VGGT各12步可丢弃profile已完成，未用于正式初始化；各自覆盖6个真实训练序列，活动Writer、Reader、接收/下游块、DPT、T0/T1均有有限非零梯度，关闭分支明确记为disabled。第12步活动读取通道门控已打开（mean_abs约0.00011–0.00012）。
 
@@ -36,6 +36,14 @@ PE-Only最终相机点严格为raw DPT点，移除锚定专属的额外相机/�
 
 正式目录为`results/step2_ablation_render_only_seed17/`、`results/step2_ablation_pe_only_seed17/`、`results/step2_ablation_isotropic_point_seed17/`。训练完成后补入六方指标、robotics分桶、曲线、实际V1/V2观察和最终测试/进程检查。Step3尚未启动。
 
-## 当前资源阻塞
+## 资源等待与正式启动
 
 2026-11-16T17:23:46+00:00：正式协调器已启动；连续资源检查仍无满足显存预留且重复低负载的GPU，因此三组正式18k尚未开始。协调器在`results/step2b_scheduler_console.log`持续记录资源并自动等待，条件满足后分配独立卡，最多三组并行。没有终止或信号任何其他进程。六方正式结果和图像审阅尚未完成，不将profile表述为18k结果。
+
+随后自动调度在UTC 17:24 / 17:42 / 17:49分别从官方权重启动Render-Only（GPU6）、PE-Only（GPU1）、Isotropic-Point（GPU3），三组现已并行；每组启动前均再次通过127项严格测试。Render-Only已完成500步检查点保存，峰值保留显存约4.60GiB；该步快速评测中T1仍有退化，保持既定等预算训练，不据此改动消融模型或损失。
+
+## 已实际审阅的补充图像
+
+在独立空闲GPU4上完成Full18k同权重、首建图帧且无融合的Single-map V2，诊断进程已正常退出。四张图位于`results/step2b_matrix_seed17/single_map_frame_vis/`，已逐张打开：C5/C6/C11可见单视锥内稀疏薄椭球及近景局部外壳；robotics远距表面的面元明显更大，近景放大图可见水平与竖直薄面元。RGB表示最薄轴绝对分量，透明度来自alpha；后续与六方V1/V2并排比较。
+
+旧三方分桶缓存缺少世界坐标L1等部分统计，已在另一张实时空闲GPU0上用各自18k权重重新前向固定11个robotics查询，补齐18项分桶指标，进程正常退出。新增缓存只写`results/step2b_matrix_seed17/diagnostics/`，不覆盖旧结果；GT仅在forward之后用于有效像素、近中远分桶及误差计算。六方正式模式要求所有方法的分桶字段齐全且有效像素数相同，当前合并状态仍为incomplete，等待三组消融完成。

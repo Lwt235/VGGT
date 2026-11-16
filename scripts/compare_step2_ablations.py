@@ -40,6 +40,29 @@ CURVE_METRICS = ('point_epe_m', 'point_l1_m', 'rotation0_deg', 'rotation1_deg',
 LABELS = ('World EPE [m]', 'World coordinate L1 [m]', 'T0 rotation [deg]', 'T1 rotation [deg]',
           'T0 translation [m]', 'T1 translation [m]', 'Native camera EPE [m]', 'Final camera EPE [m]')
 GROUPS = ('observable_all', 'cross_scene_val', 'same_scene_heldout', 'C11', 'robotics', 'C5', 'C6')
+DEPTH_LABELS = ('near_0.1_3m', 'mid_3_5m', 'far_5_10m')
+BIN_STATISTICS = ('_m', '_median_m', '_p90_m', '_max_m')
+BIN_METRICS = ('world_epe', 'world_l1', 'raw_depth_l1', 'final_depth_l1')
+BIN_REQUIRED_FIELDS = tuple(name+suffix for name in BIN_METRICS for suffix in BIN_STATISTICS)+(
+    'raw_depth_bias_m', 'final_depth_bias_m')
+
+
+def validate_depth_bins(bins, *, required_tags=TAGS):
+    """Complete final tables require measured finite statistics for every bin."""
+    for tag in required_tags:
+        if tag not in bins:
+            raise ValueError('Missing depth-bin method: '+tag)
+        for label in DEPTH_LABELS:
+            row = bins[tag].get(label, {})
+            if not isinstance(row.get('valid_pixels'), int) or row['valid_pixels'] <= 0:
+                raise ValueError('Missing valid pixel count: '+tag+'/'+label)
+            for key in BIN_REQUIRED_FIELDS:
+                if key not in row or row[key] is None or not np.isfinite(float(row[key])):
+                    raise ValueError('Missing/nonfinite depth-bin field: '+tag+'/'+label+'/'+key)
+    for label in DEPTH_LABELS:
+        counts = {bins[tag][label]['valid_pixels'] for tag in required_tags}
+        if len(counts) != 1:
+            raise ValueError('Depth-bin valid pixel masks differ across methods: '+label)
 
 
 def write_json(path, value):
@@ -238,7 +261,7 @@ def write_tables(summary, output):
             epe = ' / '.join(f"{g['point_epe_m'][s]:.4f}" for s in ('mean', 'median', 'p90', 'maximum'))
             lines.append(f"| {tag} | {epe} | {f('point_l1_m')} | {f('rotation0_deg')} / {f('rotation1_deg')} | {f('translation0_m')} / {f('translation1_m')} | {f('camera_epe_m')} / {f('anchored_camera_epe_m')} |")
         lines.append('')
-    lines += ['Per-query tails and both blind queries are preserved in JSON. Historical depth-bin fields absent from the original cache are N/A; no old checkpoint is rerun to invent them.', '']
+    lines += ['Per-query tails and both blind queries are preserved in JSON. Final depth bins use fresh read-only forwards of each method\'s 18k weights, cached under diagnostics/. All six methods require complete measured bin statistics; partial previews may show N/A.', '']
     (output/'six_way_summary.md').write_text('\n'.join(lines))
 
 
@@ -252,10 +275,15 @@ def depth_bin_comparison(output, *, allow_incomplete=False, plot=True):
     bins = data['robotics_depth_bins']
     if not allow_incomplete and (data['status'] != 'complete' or set(bins) != set(TAGS)):
         raise ValueError('Final depth-bin diagnostic must include all six methods')
-    keys = ('world_epe_m', 'world_epe_p90_m', 'world_l1_m', 'world_l1_p90_m',
-            'raw_depth_l1_m', 'raw_depth_l1_p90_m', 'raw_depth_bias_m',
-            'final_depth_l1_m', 'final_depth_l1_p90_m', 'final_depth_bias_m')
-    labels = ('near_0.1_3m', 'mid_3_5m', 'far_5_10m')
+    try:
+        validate_depth_bins(bins)
+        complete = data['status'] == 'complete'
+    except (ValueError, TypeError):
+        if not allow_incomplete:
+            raise
+        complete = False
+    keys = BIN_REQUIRED_FIELDS
+    labels = DEPTH_LABELS
     with (output/'robotics_depth_bins_comparison.csv').open('w', newline='') as handle:
         writer = csv.writer(handle)
         writer.writerow(['method', 'bin', 'valid_pixels', *keys])
@@ -275,10 +303,10 @@ def depth_bin_comparison(output, *, allow_incomplete=False, plot=True):
             ax.set(ylabel=key+' [m]')
             ax.grid(axis='y', alpha=.2)
         axes[0, 0].legend(fontsize=8)
-        fig.suptitle('11 fixed robotics queries / pooled valid pixels / no alignment; absent historical metrics are N/A, not zero')
+        fig.suptitle('11 fixed robotics queries / pooled valid pixels / no alignment; incomplete-preview fields are N/A, not zero')
         fig.savefig(output/'robotics_depth_bins_six_way.png', dpi=150)
         plt.close(fig)
-    return dict(status=data['status'], source=str(path), sha256=digest(path))
+    return dict(status='complete' if complete else 'incomplete', source=str(path), sha256=digest(path))
 
 
 def make_parser(*, comparison=True):
