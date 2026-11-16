@@ -13,6 +13,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from src.models.vggt_memory import VGGTSpatialMemory,frozen_patch_tokens,aggregate_single
 from src.models.nomemory_vggt import VGGTNoMemory
+from src.step2_data import EpisodeDataset
 from src.geometry import patch_intrinsics,invert_se3,transform_points
 from src.losses.world import pose_errors
 from src.vis.step2 import dump_json
