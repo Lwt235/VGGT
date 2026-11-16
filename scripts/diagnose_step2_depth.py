@@ -15,6 +15,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from src.step2_data import EpisodeDataset
+from src.training_state import resume_config_compatible
 from src.models.vggt_memory import VGGTSpatialMemory
 from src.vis.step2 import dump_json
 from src.losses.world import pose_errors
@@ -62,7 +63,7 @@ def evaluate_run(name, step, *, case_folder=None):
     config = yaml.safe_load((folder/'config.yaml').read_text())
     runtime = load_config()
     state = load_checkpoint_readonly(folder/f'training_state_{step:05d}.pt')
-    if state['step'] != step or state['config'] != config:
+    if state['step'] != step or not resume_config_compatible(state['config'], config):
         raise ValueError('Checkpoint/config mismatch')
     model = VGGTSpatialMemory(runtime['assets']['official_vggt_source']['path'], runtime['assets']['vggt_weights']['path'],
                               revision=config['architecture_revision'], receive_layer=config['receive_layer'], pose_jitter_probability=0.).cuda().eval()
@@ -156,15 +157,20 @@ def evaluate_run(name, step, *, case_folder=None):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--old',default='step2_full_seed17');parser.add_argument('--new',default='step2_v2_seed17');parser.add_argument('--step',type=int,default=3000);parser.add_argument('--middle')
+    parser=argparse.ArgumentParser();parser.add_argument('--old',default='step2_full_seed17');parser.add_argument('--new',default='step2_v2_seed17');parser.add_argument('--step',type=int,default=3000);parser.add_argument('--middle');parser.add_argument('--old-step',type=int)
     args=parser.parse_args()
     if not os.environ.get('VGGT_GPU_MEMORY_FRACTION'): parser.error('Use live GPU launcher')
     torch.set_num_threads(2);torch.cuda.set_per_process_memory_fraction(float(os.environ['VGGT_GPU_MEMORY_FRACTION']))
+    torch.backends.cuda.matmul.allow_tf32=True;torch.backends.cudnn.allow_tf32=True
     results, samples={},{}
     output_folder=PROJECT_ROOT/'results'/args.new
     runs=[('full',args.old),('v2',args.middle),('v3',args.new)] if args.middle else [('old',args.old),('new',args.new)]
     for tag,name in runs:
-        results[tag],samples[tag]=evaluate_run(name,args.step,case_folder=output_folder/'vis'/f'step_{args.step:05d}'/'robotics_362_diagnostic' if args.middle and tag=='v3' else None)
+        checkpoint_step=args.old_step if tag in ('old','full') and args.old_step is not None else args.step
+        results[tag],samples[tag]=evaluate_run(name,checkpoint_step,case_folder=output_folder/'vis'/f'step_{args.step:05d}'/'robotics_362_diagnostic' if args.middle and tag=='v3' else None)
+    for tag,name in runs:
+        results[tag]['run_name']=name
+        results[tag]['checkpoint_step']=args.old_step if tag in ('old','full') and args.old_step is not None else args.step
     folder=PROJECT_ROOT/'results'/args.new
     dump_json(folder/f'robotics_depth_{args.step:05d}.json',results)
     fig,axes=plt.subplots(len(runs),2,figsize=(10,4.5*len(runs)),layout='constrained')
@@ -172,7 +178,7 @@ def main():
         for col,(index,title) in enumerate(((1,'Native camera depth'),(2,'O5 anchored camera depth'))):
             v=samples[tag];axes[row,col].hexbin(v[:,0],v[:,index],gridsize=55,mincnt=1,cmap='viridis',bins='log')
             axes[row,col].plot([0,10],[0,10],'r--',lw=1)
-            axes[row,col].set(xlim=(0,10),ylim=(0,10),xlabel='GT camera z [m]',ylabel='Predicted camera z [m]',title=tag+': '+title)
+            axes[row,col].set(xlim=(0,10),ylim=(0,10),xlabel='GT camera z [m]',ylabel='Predicted camera z [m]',title=tag+' @ '+str(results[tag]['checkpoint_step'])+': '+title)
     fig.suptitle('Robotics: all 11 unseen queries, unchanged splits; no output alignment')
     fig.savefig(folder/f'robotics_depth_{args.step:05d}.png',dpi=160);plt.close(fig)
     print(json.dumps(results,indent=2))
