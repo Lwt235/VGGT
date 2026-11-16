@@ -35,6 +35,8 @@ SCENES = ('harvard_c5/hv_c5_1', 'harvard_c6/hv_c6_1',
 METRICS = ('point_epe_m', 'point_l1_m', 'coarse_point_epe_m',
            'rotation0_deg', 'rotation1_deg', 'translation0_m', 'translation1_m',
            'camera_epe_m', 'anchored_camera_epe_m')
+BLIND_DIAGNOSTICS = ('dustbin_mean', 'dustbin_rejection_rate', 'refined_dustbin_mean',
+                     'surface_support_rate')
 CURVE_METRICS = ('point_epe_m', 'point_l1_m', 'rotation0_deg', 'rotation1_deg',
                  'translation0_m', 'translation1_m', 'camera_epe_m', 'anchored_camera_epe_m')
 LABELS = ('World EPE [m]', 'World coordinate L1 [m]', 'T0 rotation [deg]', 'T1 rotation [deg]',
@@ -116,6 +118,14 @@ def metric_value(row, key, tag):
     if not np.isfinite(value):
         raise ValueError('Nonfinite metric '+key+' in '+tag)
     return value
+
+
+def blind_query_record(row, tag):
+    """Preserve each method's measured rejection; absent diagnostics are null."""
+    return dict(scene=row['scene'], query_frame_id=row['query_frame_id'],
+        mapping_frame_ids=row['mapping_frame_ids'], split=row['split'], benchmark_observable=False,
+        **{key:metric_value(row, key, tag) for key in METRICS},
+        **{key:row.get(key) for key in BLIND_DIAGNOSTICS})
 
 
 def stats(values):
@@ -349,8 +359,7 @@ def main():
         data[tag] = rows
         sources[tag] = dict(path=str(path), sha256=digest(path))
     summary = {tag:summarize_run(rows, sequences, tag) for tag, rows in data.items()}
-    blinds = {tag:[dict(scene=r['scene'], query_frame_id=r['query_frame_id'], mapping_frame_ids=r['mapping_frame_ids'],
-                        split=r['split'], benchmark_observable=False, **{k:metric_value(r, k, tag) for k in METRICS})
+    blinds = {tag:[blind_query_record(r, tag)
                     for r in rows if not benchmark_observable(r, sequences)] for tag, rows in data.items()}
     curves = collect_curves(roots, sequences, reference, allow_incomplete=args.allow_incomplete)
     for tag, curve in curves.items():

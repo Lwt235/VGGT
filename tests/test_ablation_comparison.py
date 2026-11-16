@@ -8,7 +8,7 @@ import torch
 
 from scripts.compare_step2_ablations import (TAGS, DEFAULT_RUNS, METRICS, STEPS, SCENES,
     validate_episodes, metric_value, summarize_run, make_montage, image_source, collect_curves,
-    BIN_REQUIRED_FIELDS, depth_bin_comparison)
+    BIN_REQUIRED_FIELDS, depth_bin_comparison, blind_query_record, BLIND_DIAGNOSTICS)
 from scripts.diagnose_step2_ablations import accumulate_bins, summarize_bins, DEPTH_BINS
 
 
@@ -60,6 +60,27 @@ def test_no_memory_final_camera_identity_is_explicit_and_other_missing_values_fa
         metric_value(row, 'anchored_camera_epe_m', 'Full')
     with pytest.raises(ValueError, match='Nonfinite'):
         metric_value(dict(camera_epe_m=float('nan')), 'camera_epe_m', 'Full')
+
+
+def test_blind_summary_preserves_own_rejection_fields_and_marks_unavailable_null():
+    _, data = protocol()
+    base = data['episodes'][-1]
+    full = dict(base, dustbin_mean=.82, dustbin_rejection_rate=.91,
+                refined_dustbin_mean=.87, surface_support_rate=.012)
+    single = dict(base, dustbin_mean=.73, dustbin_rejection_rate=.78)
+    no_memory = dict(base, surface_support_rate=.012)
+    result = {tag:blind_query_record(row, tag) for tag, row in
+              (('Full', full), ('Single-map', single), ('No-Memory', no_memory))}
+    for key in BLIND_DIAGNOSTICS:
+        assert result['Full'][key] == full[key]
+    assert result['Single-map']['dustbin_mean'] == .73
+    assert result['Single-map']['dustbin_rejection_rate'] == .78
+    assert result['Single-map']['refined_dustbin_mean'] is None
+    assert result['Single-map']['surface_support_rate'] is None
+    assert all(result['No-Memory'][key] is None for key in BLIND_DIAGNOSTICS if key != 'surface_support_rate')
+    assert result['No-Memory']['surface_support_rate'] == .012
+    assert json.loads(json.dumps(result))['No-Memory']['dustbin_mean'] is None
+    assert result['Full']['query_frame_id'] == base['query_frame_id']
 
 
 def test_curves_use_exact_126_evaluations_and_single_map_has_no_trajectory(tmp_path):
