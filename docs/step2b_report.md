@@ -35,3 +35,7 @@ PE-Only最终相机点严格为raw DPT点，移除锚定专属的额外相机/�
 根盘仅余约3.8GiB，旧产物全部保留。每500步原子替换各自latest完整状态，18k保留hardlink；共享写锁避免三个tmp同时占盘。完整评测仍保存0/1500/3000/6000/12000/18000；仅减少冗余optimizer里程碑副本，不改变训练或评估。
 
 正式目录为`results/step2_ablation_render_only_seed17/`、`results/step2_ablation_pe_only_seed17/`、`results/step2_ablation_isotropic_point_seed17/`。训练完成后补入六方指标、robotics分桶、曲线、实际V1/V2观察和最终测试/进程检查。Step3尚未启动。
+
+## 当前资源阻塞
+
+2026-11-16T17:23:46+00:00：正式协调器已启动；连续资源检查仍无满足显存预留且重复低负载的GPU，因此三组正式18k尚未开始。协调器在`results/step2b_scheduler_console.log`持续记录资源并自动等待，条件满足后分配独立卡，最多三组并行。没有终止或信号任何其他进程。六方正式结果和图像审阅尚未完成，不将profile表述为18k结果。
