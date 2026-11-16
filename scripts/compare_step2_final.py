@@ -20,7 +20,7 @@ def stats(values):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--full',default='step2_v4_full_seed17');parser.add_argument('--baseline',default='step2_nomemory_seed17');parser.add_argument('--step',type=int,default=18000)
+    parser=argparse.ArgumentParser();parser.add_argument('--full',default='step2_v5_full_seed17');parser.add_argument('--baseline',default='step2_nomemory_seed17');parser.add_argument('--step',type=int,default=18000)
     args=parser.parse_args();names=[args.full,args.baseline];tags=['Full','No-Memory']
     roots=[PROJECT_ROOT/'results'/n for n in names]
     data=[json.loads((p/f'evaluation_{args.step:05d}_full.json').read_text()) for p in roots]

@@ -19,7 +19,7 @@ from src.vis.step2 import dump_json
 
 @torch.no_grad()
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--full',default='step2_v4_full_seed17');ap.add_argument('--baseline',default='step2_nomemory_seed17');ap.add_argument('--step',type=int,default=18000)
+    ap=argparse.ArgumentParser();ap.add_argument('--full',default='step2_v5_full_seed17');ap.add_argument('--baseline',default='step2_nomemory_seed17');ap.add_argument('--step',type=int,default=18000)
     args=ap.parse_args()
     if not os.environ.get('VGGT_GPU_MEMORY_FRACTION'):ap.error('Use live GPU launcher')
     torch.set_num_threads(2);torch.cuda.set_per_process_memory_fraction(float(os.environ['VGGT_GPU_MEMORY_FRACTION']))

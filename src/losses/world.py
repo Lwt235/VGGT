@@ -147,6 +147,10 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
     base, metrics = _legacy_world_loss(output, target, camera_weight=camera_weight,
                                        refinement_safety_weight=refinement_safety_weight, anchor_weight=0., matching_weight=0.)
     match, anchor, support_rate, observable = open_set_matching_loss(output, target)
+    refined_match = match*0
+    if 'refined_matching_attention' in output:
+        refined_output = dict(output, matching_attention=output['refined_matching_attention'], anchors=output['refined_anchors'])
+        refined_match, _, _, _ = open_set_matching_loss(refined_output, target)
     hp, wp = output['rendered'].opacity.shape[:2]
     valid = target.valid.float()
     fraction = F.adaptive_avg_pool2d(valid[None, None], (hp, wp))[0, 0].flatten()
@@ -160,7 +164,7 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
     camera_delta = output.get('raw_camera_points', output['camera_points'])[target.valid]-camera_truth[target.valid]
     # No random-world pose/point/anchor loss on the unobservable frame.
     loss = base+anchor_weight*anchor if observable else camera_weight*camera_delta.abs().mean()
-    loss = loss+matching_weight*match+depth_weight*(z_loss+.05*confidence_loss)
+    loss = loss+matching_weight*(match+refined_match)+depth_weight*(z_loss+.05*confidence_loss)
     relative_camera = (camera_delta[:, 2].abs()/camera_truth[target.valid][:, 2].clamp_min(.2)).mean()
     anchored_delta = output['camera_points'][target.valid]-camera_truth[target.valid]
     anchored_l1 = anchored_delta.abs().mean()
@@ -176,6 +180,9 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
                    dustbin_mean=float(output['dustbin_probability'].detach().mean()),
                    dustbin_rejection_rate=float((output['dustbin_probability'].detach() > .5).float().mean()),
                    match_mass=float(output['match_mass'].detach()))
+    if 'refined_matching_attention' in output:
+        metrics['refined_correspondence_loss'] = float(refined_match.detach())
+        metrics['refined_dustbin_mean'] = float(output['refined_matching_attention'][:, -1].detach().mean())
     if 'raw_camera_points' in output:
         metrics['anchored_camera_epe_m'] = float((output['camera_points'][target.valid]-camera_truth[target.valid]).detach().norm(dim=-1).mean())
     if 'T0_read' in output:

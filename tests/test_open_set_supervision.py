@@ -107,3 +107,16 @@ def test_v3_final_camera_supervision_trains_anchoring_without_blind_pose_leak():
     loss.backward()
     assert raw.grad.abs().sum()>0 and output['camera_points'].grad.abs().sum()>0
     assert t.grad is None or t.grad.abs()==0
+
+
+def test_refined_matching_gets_balanced_positive_and_blind_rejection_supervision():
+    for blind in (False, True):
+        truth, output, _, _, _ = example(blind)
+        refined_logits=torch.zeros(3,4,requires_grad=True)
+        W=refined_logits.softmax(-1)
+        output.update(refined_matching_attention=W,refined_anchors=W[:,:-1]@output['anchor_support_means'])
+        loss,metrics=world_loss(output,truth)
+        loss.backward()
+        assert 'refined_correspondence_loss' in metrics
+        assert torch.isfinite(refined_logits.grad).all()
+        assert ((refined_logits.grad[:,-1]<0) if blind else (refined_logits.grad[:,-1]>0)).all()

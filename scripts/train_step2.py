@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import yaml
 from src.step2_data import EpisodeDataset
+from src.evaluation import benchmark_observable
 from src.augmentation import augment_training_world
 from src.losses.world import world_loss, surface_support_rate
 from src.losses.mapping import supervise_mapping_observation
@@ -43,7 +44,8 @@ def build_optimizer(model, config):
     add([model.initial_pose.dustbin_logit], opt['dustbin_lr'], 0)
     add(model.initial_pose.dustbin_head.parameters(), opt['dustbin_head_lr'])
     add(model.initial_pose.parameters(), opt['bootstrap_lr'])
-    add(model.refine_pose.residual_pose.parameters(), opt['refinement_geometry_lr'])
+    if hasattr(model.refine_pose, 'residual_pose'):
+        add(model.refine_pose.residual_pose.parameters(), opt['refinement_geometry_lr'])
     add(model.refine_pose.parameters(), opt['pose_lr'])
     add(model.native.parameters(), opt['native_lr'])
     add(model.parameters(), opt['heads_lr'])
@@ -105,7 +107,7 @@ def evaluate(model, dataset, config, folder, step, *, quick=False, interventions
         metrics['depth_confidence_mean'] = float(full['local_geometry_confidence'].mean())
         if 'camera_scale' in full:
             metrics.update(camera_scale=float(full['camera_scale']), depth_confidence_mean=float(full['local_geometry_confidence'].mean()))
-        item = dict(**spec, **metrics, public_gaussians=len(memory), active_gaussians=len(full['attention']['indices']))
+        item = dict(**spec, benchmark_observable=benchmark_observable(spec, {sid:item for sid, (_, item) in dataset.scenes.items()}), **metrics, public_gaussians=len(memory), active_gaussians=len(full['attention']['indices']))
         if interventions:
             empty = model(query, memory.subset(slice(0, 0)))
             _, item['empty_same_weights'] = criterion(empty, target, config)
@@ -133,8 +135,8 @@ def evaluate(model, dataset, config, folder, step, *, quick=False, interventions
         del full, memory, episode
     aggregates = []
     for split in ('cross_scene_val', 'same_scene_heldout'):
-        rows = [r for r in records if r['split']==split and r['surface_support_rate'] >= .05]
-        blind = [r for r in records if r['split']==split and r['surface_support_rate'] < .05]
+        rows = [r for r in records if r['split']==split and r['benchmark_observable']]
+        blind = [r for r in records if r['split']==split and not r['benchmark_observable']]
         if not rows:
             raise RuntimeError('No covisible validation episodes')
         keys = ('point_epe_m', 'coarse_point_epe_m', 'rotation0_deg', 'rotation1_deg', 'translation0_m', 'translation1_m', 'camera_epe_m', 'surface_support_rate')
@@ -229,7 +231,7 @@ def main():
             mapping, target, _ = augment_training_world(episode['mapping'], target)
             optimizer.zero_grad(set_to_none=True)
             memory = model.build_memory(mapping); memory.retain_grad()
-            read_jitter = sample_read_jitter('cuda', include_zero=config.get('architecture_revision')=='step2_v4') if random.random() < config['read_jitter_probability'] and surface_support_rate(memory.means, memory.covars, target) >= .05 else None
+            read_jitter = sample_read_jitter('cuda', include_zero=config.get('architecture_revision') in ('step2_v4', 'step2_v5')) if random.random() < config['read_jitter_probability'] and surface_support_rate(memory.means, memory.covars, target) >= .05 else None
             prediction = model(query, memory, read_jitter=read_jitter)
             loss, metrics = criterion(prediction, target, config)
             metrics['depth_confidence_mean'] = float(prediction['local_geometry_confidence'].detach().mean())
@@ -237,6 +239,10 @@ def main():
                 metrics.update(camera_scale=float(prediction['camera_scale'].detach()), depth_confidence_mean=float(prediction['local_geometry_confidence'].detach().mean()))
             lm = prediction['lm_energy_history']
             metrics.update(lm_energy_initial=float(lm[0]), lm_energy_final=float(lm[-1]), lm_energy_nonincreasing=bool((torch.diff(lm) <= 1e-6).all()))
+            if 'refinement_lm_energy_history' in prediction:
+                history = prediction['refinement_lm_energy_history']
+                metrics.update(refinement_lm_energy_initial=float(history[0]), refinement_lm_energy_final=float(history[-1]),
+                    refinement_lm_energy_nonincreasing=bool((torch.diff(history)<=1e-6).all()))
             if config['mapping_self_observation']:
                 map_loss, map_metrics = supervise_mapping_observation(model, memory, mapping[step % len(mapping)])
                 loss = loss+map_loss; metrics.update(map_metrics); del map_loss
@@ -282,7 +288,7 @@ def main():
                     if current['point_epe_m'] > config['systemic_epe_limit_m']:
                         raise RuntimeError('Systemic cross-scene EPE collapse above configured limit: '+str(current['point_epe_m']))
             if step > 50 and (step+1) % 100 == 0:
-                for name in ('writer','o5','o6','downstream'):
+                for name in ('writer','o5','o6','downstream','pose1'):
                     if not any(r['module_grad_norms'][name] > 0 for r in records[-50:]): raise RuntimeError('Persistent disconnected '+name)
     summary = dict(completed_steps=until, profile=bool(args.profile), initialization='fresh_official_vggt', image_hw=config['image_hw'],
         final_loss_mean=float(np.mean([r['loss'] for r in records[-min(100,len(records)):]])),

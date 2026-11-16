@@ -282,7 +282,9 @@ class SpatialBootstrap(nn.Module):
         return T, dict(anchors=anchors, confidence=p_match, camera_patch_points=points, z_cam=z, c_depth=c_depth,
             matching_attention=W, dustbin_probability=W[:, -1], bootstrap_attention=inlier,
             bootstrap_support=torch.ones(len(memory), device=z.device, dtype=torch.bool),
-            anchor_votes=votes, match_mass=p_match.sum(), **extras)
+            anchor_votes=votes, match_mass=p_match.sum(), matching_query=q, matching_keys=k,
+            matching_dustbin_logit=dustbin, matching_temperature=self.log_temperature.exp().clamp(max=60.),
+            camera_rays=rays, **extras)
 
 
 class SpatialRefinement(nn.Module):

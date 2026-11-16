@@ -102,7 +102,7 @@ def planar_safe_initial(points, anchors, weights, *, whiten=True, iterations=2):
 
 def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4,
                           kappa=3., radial_precision=4., damping=.01,
-                          return_diagnostic=False, metric_scale=False, planar_safe=False):
+                          return_diagnostic=False, metric_scale=False, planar_safe=False, init_pose=None):
     # Import locally: the legacy initialization remains available for restoring
     # older project runs, while the v2l update never uses Gram-Schmidt again.
     from src.models.spatial_pose import point_irls_pose
@@ -115,6 +115,14 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
     rays = F.normalize(rays, dim=-1)
     precision = torch.linalg.inv(covars)
     planar_candidate = None
+    if init_pose is not None:
+        init_pose = init_pose.to(device="cpu", dtype=torch.float64)
+        # Refinement starts at the supplied prediction. No moment/center reset.
+        planar_safe = False
+        metric_scale = False
+        direction = rays @ init_pose[:3, :3].T
+        radial_reference = ((anchors-init_pose[:3, 3])*direction).sum(-1).clamp_min(.05)
+        points = rays*radial_reference[:, None]
     if planar_safe:
         Rwhite, twhite, scatter_scale, initial_votes = planar_safe_initial(points, anchors, weights)
         Rplain, tplain, _, _ = planar_safe_initial(points, anchors, weights, whiten=False)
@@ -129,8 +137,10 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
         scatter_scale = (scatter(anchors)/scatter(points).clamp_min(1e-6)).clamp_min(1e-12).sqrt().clamp(.25, 4.)
         points = scatter_scale*points
     radial = points.norm(dim=-1)
-    alpha = .04/(radial+.5).square() if metric_scale else torch.full_like(radial, radial_precision)
-    if planar_safe:
+    alpha = .04/(radial+.5).square() if metric_scale or init_pose is not None else torch.full_like(radial, radial_precision)
+    if init_pose is not None:
+        R, t = init_pose[:3, :3], init_pose[:3, 3]
+    elif planar_safe:
         R, t = Rwhite, twhite
     else:
         initial, _ = point_irls_pose(points, anchors, weights, iterations=0)
@@ -159,20 +169,21 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
         R = torch.where(choose_plain, plain_R, R)
         t = torch.where(choose_plain, plain_t, t)
 
-    # One anisotropic center initialization, regularized to a transported
-    # centroid prior. Accept only when the SAME robust energy does not rise.
-    direction = rays @ R.T
-    Ad = torch.einsum('qij,qj->qi', precision, direction)
-    denominator = (Ad*direction).sum(-1)+alpha
-    W = precision-Ad[:, :, None]*Ad[:, None, :]/denominator[:, None, None]
-    A = (weights[:, None, None]*W).sum(0)
-    b = (weights[:, None]*(torch.einsum('qij,qj->qi', W, anchors)
-                          -alpha[:, None]*radial[:, None]*Ad/denominator[:, None])).sum(0)
-    regularizer = 1e-4*A.trace()/3+1e-8
-    candidate = torch.linalg.solve(A+regularizer*eye3, b+regularizer*t)
-    old_energy = state(R, t)[-1]
-    candidate_energy = state(R, candidate)[-1]
-    t = torch.where(torch.isfinite(candidate_energy) & (candidate_energy <= old_energy), candidate, t)
+    if init_pose is None:
+        # One anisotropic center initialization, regularized to a transported
+        # centroid prior. Accept only when the SAME robust energy does not rise.
+        direction = rays @ R.T
+        Ad = torch.einsum('qij,qj->qi', precision, direction)
+        denominator = (Ad*direction).sum(-1)+alpha
+        W = precision-Ad[:, :, None]*Ad[:, None, :]/denominator[:, None, None]
+        A = (weights[:, None, None]*W).sum(0)
+        b = (weights[:, None]*(torch.einsum('qij,qj->qi', W, anchors)
+                              -alpha[:, None]*radial[:, None]*Ad/denominator[:, None])).sum(0)
+        regularizer = 1e-4*A.trace()/3+1e-8
+        candidate = torch.linalg.solve(A+regularizer*eye3, b+regularizer*t)
+        old_energy = state(R, t)[-1]
+        candidate_energy = state(R, candidate)[-1]
+        t = torch.where(torch.isfinite(candidate_energy) & (candidate_energy <= old_energy), candidate, t)
     history = [state(R, t)[-1].detach()]
     scales = []
     for _ in range(iterations):

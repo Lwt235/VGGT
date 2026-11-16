@@ -34,5 +34,5 @@ description: Fresh official single-frame VGGT+DPT+pose; RGB/K only, no mapping i
 checkpoint_milestones:
 - 3000
 - 18000
-source_full_run: step2_v4_full_seed17
+source_full_run: step2_v5_full_seed17
 training_gauge: first_mapping_camera_G_identity

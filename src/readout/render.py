@@ -44,12 +44,13 @@ def camera_facing_normals(covars, means, center):
 
 
 class RenderReader(nn.Module):
-    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False, camera_frame=False, local_multiplicative=False):
+    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False, camera_frame=False, local_multiplicative=False, physical_local=False):
         super().__init__()
         self.latent_dim = latent_dim
         self.surface_normals = surface_normals
         self.camera_frame = camera_frame
         self.local_multiplicative = local_multiplicative
+        self.physical_local = physical_local
         self.project = nn.Sequential(nn.Linear(latent_dim+(8 if camera_frame else 5), token_dim), nn.GELU(), nn.Linear(token_dim, token_dim))
         self.unseen = nn.Parameter(torch.zeros(token_dim))
         self.norm = nn.LayerNorm(token_dim)
@@ -58,7 +59,7 @@ class RenderReader(nn.Module):
         if metric_depth:
             self.depth_confidence = nn.Sequential(nn.Linear(latent_dim+4, 64), nn.GELU(), nn.Linear(64, 1))
             nn.init.zeros_(self.depth_confidence[-1].weight)
-            nn.init.constant_(self.depth_confidence[-1].bias, 1. if local_multiplicative else 0.)
+            nn.init.constant_(self.depth_confidence[-1].bias, 1. if local_multiplicative or physical_local else 0.)
 
     def calibrate_camera_scale(self, camera_points, rendered):
         """Map-only metric scale inside forward, with smooth unseen fallback.
@@ -110,7 +111,8 @@ class RenderReader(nn.Module):
             tiles = F.interpolate(factor.reshape(hp*wp, 1, 1, 1), size=(h//hp, w//wp), mode='bilinear', align_corners=False)
             scale = tiles.reshape(hp, wp, h//hp, w//wp).permute(0, 2, 1, 3).reshape(h, w)
             return camera_points*(1+scale[..., None]), confidence
-        correction = confidence*rendered.opacity/(1+variance)*(rendered.depth-native_depth)
+        modulation = .65+.35*confidence if self.physical_local else confidence
+        correction = modulation*rendered.opacity/(1+variance)*(rendered.depth-native_depth)
         correction = F.interpolate(correction.permute(2, 0, 1)[None], size=(h, w), mode='bilinear', align_corners=False)[0, 0]
         from src.geometry import pixel_grid
         grid = pixel_grid(h, w, device=K_cv.device, dtype=K_cv.dtype, center=0.)

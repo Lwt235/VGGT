@@ -12,6 +12,9 @@ def pose_consistency_loss(partial, teacher, target, *, erased_reference=None, ma
     matching = partial['T0'].sum()*0
     if 'matching_attention' in partial:
         matching, _, _, observable = open_set_matching_loss(partial, target, erased_reference)
+        if 'refined_matching_attention' in partial:
+            refined = dict(partial, matching_attention=partial['refined_matching_attention'], anchors=partial['refined_anchors'])
+            matching = matching+open_set_matching_loss(refined, target, erased_reference)[0]
         if not observable:
             return matching_weight*matching, dict(counterfactual_pose_loss=0., counterfactual_matching_loss=float(matching.detach()))
     supervised, consistent = [], []
