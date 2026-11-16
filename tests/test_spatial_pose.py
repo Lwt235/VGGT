@@ -312,10 +312,13 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
             return tokens, rendered
         def render(self, memory, pose, *args):
             self.final_pose = pose
-            return rendered
+            self.final_render = RenderedMemory(rendered.world, rendered.features, rendered.depth+1,
+                                               rendered.depth_variance, rendered.opacity)
+            return self.final_render
         def anchor_camera_geometry(self, points, *args):
             if revision == 'step2_v2':
                 assert hasattr(self, 'final_pose')
+                assert args[0] is self.final_render
             return points+1, torch.ones(2, 3, 1)
     class PE(nn.Module):
         def forward(self, tokens, *args, **kwargs):
@@ -325,7 +328,11 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
             assert points.data_ptr() == raw.data_ptr()
             torch.testing.assert_close(points, raw, atol=0, rtol=0)
             self.seen_pose = args[0]
-            return args[0], torch.zeros(2, 3, 3), torch.zeros(2, 3, 3)
+            refined = args[0]
+            if revision == 'step2_v2':
+                delta = torch.eye(4); delta[2, 3] = .2
+                refined = refined @ delta
+            return refined, torch.zeros(2, 3, 3), torch.zeros(2, 3, 3)
     model = adapter.VGGTSpatialMemory.__new__(adapter.VGGTSpatialMemory)
     nn.Module.__init__(model)
     model.revision, model.receive_layer = revision, 4
@@ -344,7 +351,11 @@ def test_refinement_receives_raw_native_points_before_local_depth_anchor(monkeyp
     prediction = model(query, memory)
     assert prediction['raw_camera_points'].data_ptr() == raw.data_ptr()
     torch.testing.assert_close(prediction['camera_points'], raw+1)
-    torch.testing.assert_close(prediction['world_points'], raw+1)
+    expected_world = raw+1+(raw.new_tensor([0., 0., .2]) if revision == 'step2_v2' else 0)
+    torch.testing.assert_close(prediction['world_points'], expected_world)
+    if revision == 'step2_v2':
+        torch.testing.assert_close(model.render_reader.final_pose, prediction['T1'])
+        assert not torch.equal(model.render_reader.final_pose, prediction['T0_read'])
     if revision in ('v2l', 'step2_v2'):
         from src.models.ellipsoid_pose import sample_read_jitter
         jitter = sample_read_jitter('cpu')
