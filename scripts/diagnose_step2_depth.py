@@ -78,11 +78,23 @@ def evaluate_run(name, step, *, case_folder=None):
         query, target = episode['query']
         memory = model.build_memory(episode['mapping'])
         out = model(query, memory, return_attention=True)
-        if 'camera_scale' in out:
+        if 'local_geometry_confidence' in out and 'rendered_T1' in out:
             visible=out['rendered_T1'].opacity[...,0]>.1
             confidence=out['local_geometry_confidence'][...,0]
-            calibration_stats.append(dict(query=spec['query_frame_id'],gamma=float(out['camera_scale']),confidence_mean=float(confidence.mean()),
-                confidence_visible=float(confidence[visible].mean()) if visible.any() else None,visible_fraction=float(visible.float().mean())))
+            from torch.nn import functional as F
+            rendered=out['rendered_T1'];hp,wp=rendered.depth.shape[:2]
+            fraction=F.adaptive_avg_pool2d(target.valid.float()[None,None],(hp,wp))[0,0]
+            truth_patch=F.adaptive_avg_pool2d((target.depth*target.valid)[None,None],(hp,wp))[0,0]/fraction.clamp_min(1e-6)
+            native_patch=F.adaptive_avg_pool2d(out['raw_camera_points'][...,2][None,None],(hp,wp))[0,0]
+            good=(fraction>.25)&visible
+            rel_var=rendered.depth_variance[...,0]/rendered.depth[...,0].square().clamp_min(.04)
+            effective=confidence*rendered.opacity[...,0]/(1+rel_var)
+            calibration_stats.append(dict(query=spec['query_frame_id'],gamma=float(out['camera_scale']) if 'camera_scale' in out else None,confidence_mean=float(confidence.mean()),
+                confidence_visible=float(confidence[visible].mean()) if visible.any() else None,visible_fraction=float(visible.float().mean()),
+                visible_relative_variance=float(rel_var[good].mean()) if good.any() else None,
+                effective_visible_correction_weight=float(effective[good].mean()) if good.any() else None,
+                rendered_visible_depth_l1_m=float((rendered.depth[...,0][good]-truth_patch[good]).abs().mean()) if good.any() else None,
+                native_visible_patch_depth_l1_m=float((native_patch[good]-truth_patch[good]).abs().mean()) if good.any() else None))
         info = out['attention']
         weights = info['attention']
         if weights is not None:
