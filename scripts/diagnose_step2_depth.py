@@ -72,7 +72,7 @@ def evaluate_run(name, step, *, case_folder=None):
     dataset = EpisodeDataset(PROJECT_ROOT/config['split'], config['image_hw'])
     specs = [s for s in dataset.evaluation_episodes() if s['scene'].startswith('harvard_robotics_lab/')]
     buffers = {label:[] for label in ('near_0.1_3m', 'mid_3_5m', 'far_5_10m')}
-    scatter, poses, attention_stats, calibration_stats, case_vis = [], [], [], [], []
+    scatter, poses, attention_stats, calibration_stats, case_vis, refinement_lm = [], [], [], [], [], []
     for spec in specs:
         episode = dataset.episode(spec['scene'], spec['mapping_frame_ids'], spec['query_frame_id'], device='cuda')
         query, target = episode['query']
@@ -88,13 +88,20 @@ def evaluate_run(name, step, *, case_folder=None):
             native_patch=F.adaptive_avg_pool2d(out['raw_camera_points'][...,2][None,None],(hp,wp))[0,0]
             good=(fraction>.25)&visible
             rel_var=rendered.depth_variance[...,0]/rendered.depth[...,0].square().clamp_min(.04)
-            effective=confidence*rendered.opacity[...,0]/(1+rel_var)
+            modulation=.65+.35*confidence if model.render_reader.physical_local else confidence
+            effective=modulation*rendered.opacity[...,0]/(1+rel_var)
             calibration_stats.append(dict(query=spec['query_frame_id'],gamma=float(out['camera_scale']) if 'camera_scale' in out else None,confidence_mean=float(confidence.mean()),
                 confidence_visible=float(confidence[visible].mean()) if visible.any() else None,visible_fraction=float(visible.float().mean()),
                 visible_relative_variance=float(rel_var[good].mean()) if good.any() else None,
                 effective_visible_correction_weight=float(effective[good].mean()) if good.any() else None,
                 rendered_visible_depth_l1_m=float((rendered.depth[...,0][good]-truth_patch[good]).abs().mean()) if good.any() else None,
                 native_visible_patch_depth_l1_m=float((native_patch[good]-truth_patch[good]).abs().mean()) if good.any() else None))
+        if 'refinement_lm_energy_history' in out:
+            W1=out['refined_matching_attention']
+            refinement_lm.append(dict(query=spec['query_frame_id'], energy_history=out['refinement_lm_energy_history'].cpu().tolist(),
+                accepted_scales=out['refinement_lm_accepted_scales'].cpu().tolist(),
+                matching_normalized_entropy=float(-(W1*W1.clamp_min(1e-9).log()).sum(-1).mean()/np.log(max(2,W1.shape[-1]))),
+                dustbin_mean=float(W1[:,-1].mean())))
         info = out['attention']
         weights = info['attention']
         if weights is not None:
@@ -109,10 +116,18 @@ def evaluate_run(name, step, *, case_folder=None):
         raw = out['raw_camera_points'][..., 2]
         anchored = out['camera_points'][..., 2]
         world_error = (out['world_points']-target.world_points).norm(dim=-1)
+        from src.geometry import pixel_grid, transform_points, invert_se3
+        grid=pixel_grid(*target.depth.shape,device=query.K.device,dtype=query.K.dtype,center=0.)
+        calibrated_rays=grid@torch.linalg.inv(query.K).T
+        truth_camera=transform_points(target.world_points,invert_se3(target.c2w))
+        native_offray=(out['raw_camera_points']-calibrated_rays*raw[...,None]).norm(dim=-1)
+        final_offray=(out['camera_points']-calibrated_rays*anchored[...,None]).norm(dim=-1)
+        native_camera_error=(out['raw_camera_points']-truth_camera).norm(dim=-1)
+        final_camera_error=(out['camera_points']-truth_camera).norm(dim=-1)
         for label, (lo, hi) in zip(buffers, ((.1,3.),(3.,5.),(5.,10.))):
             mask = target.valid & (target.depth >= lo) & (target.depth < hi)
             if mask.any():
-                values = torch.stack((world_error[mask], (raw-target.depth)[mask], (anchored-target.depth)[mask]), -1).cpu().numpy()
+                values = torch.stack((world_error[mask], (raw-target.depth)[mask], (anchored-target.depth)[mask],native_offray[mask],final_offray[mask],native_camera_error[mask],final_camera_error[mask]), -1).cpu().numpy()
                 buffers[label].append(values)
         mask = target.valid.flatten().nonzero().flatten()[::40]
         scatter.append(torch.stack((target.depth.flatten()[mask], raw.flatten()[mask], anchored.flatten()[mask]), -1).cpu().numpy())
@@ -134,10 +149,10 @@ def evaluate_run(name, step, *, case_folder=None):
     for label, arrays in buffers.items():
         values = np.concatenate(arrays)
         bins[label] = dict(valid_pixels=len(values), world_epe_m=float(values[:,0].mean()), raw_depth_bias_m=float(values[:,1].mean()),
-                           anchored_depth_bias_m=float(values[:,2].mean()), raw_depth_l1_m=float(np.abs(values[:,1]).mean()), anchored_depth_l1_m=float(np.abs(values[:,2]).mean()))
+                           anchored_depth_bias_m=float(values[:,2].mean()), raw_depth_l1_m=float(np.abs(values[:,1]).mean()), anchored_depth_l1_m=float(np.abs(values[:,2]).mean()),native_off_calibrated_ray_m=float(values[:,3].mean()),final_off_calibrated_ray_m=float(values[:,4].mean()),native_camera_epe_m=float(values[:,5].mean()),final_camera_epe_m=float(values[:,6].mean()))
     del model
     torch.cuda.empty_cache()
-    return dict(pixel_weighted_depth_bins=bins,query_pose=poses,o6_attention=attention_stats,camera_calibration=calibration_stats,case_visualizations=case_vis), np.concatenate(scatter)
+    return dict(pixel_weighted_depth_bins=bins,query_pose=poses,o6_attention=attention_stats,camera_calibration=calibration_stats,case_visualizations=case_vis,refinement_lm=refinement_lm), np.concatenate(scatter)
 
 
 def main():

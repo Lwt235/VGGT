@@ -76,6 +76,10 @@ def test_smooth_local_ray_anchor_no_tiles_no_leak_beyond_half_patch():
     rays=pixel_grid(h,w,device=K.device,dtype=K.dtype,center=0.)@torch.linalg.inv(K).T
     correction=full-raw
     torch.testing.assert_close(correction,rays*correction[...,2:3],atol=3e-7,rtol=1e-6)
+    # A zero-mean sharp native depth edge stays sharp after low-frequency O5.
+    sharp=raw.clone();sharp[20,20,2]+=.4;sharp[20,21,2]-=.4
+    anchored,_=reader.anchor_camera_geometry(sharp,rendered,K)
+    torch.testing.assert_close(anchored[...,2]-full[...,2],sharp[...,2]-raw[...,2],atol=1e-6,rtol=0)
     full.sum().backward();assert depth.grad.abs().sum()>0 and torch.isfinite(depth.grad).all()
     partial.opacity.zero_();empty,_=reader.anchor_camera_geometry(raw,partial,K)
     torch.testing.assert_close(empty,raw,atol=0,rtol=0)
