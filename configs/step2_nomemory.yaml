@@ -1,0 +1,45 @@
+seed: 17
+architecture_revision: single_frame_nomemory
+initialization: official_vggt_only_no_smoke_checkpoint
+split: configs/step2_splits.yaml
+steps: 18000
+midpoint_steps: 3000
+image_hw:
+- 168
+- 224
+receive_layer: 4
+downstream_trainable_global_block: 11
+camera_alignment_weight: 0.2
+patch_depth_weight: 2.0
+relative_depth_weight: 0.2
+optimizer:
+  heads_lr: 0.0003
+  pose_lr: 0.0002
+  bootstrap_lr: 0.0003
+  dustbin_lr: 0.005
+  dustbin_head_lr: 0.0005
+  gate_lr: 0.001
+  refinement_geometry_lr: 0.0002
+  native_lr: 3.0e-06
+  warmup_steps: 200
+  end_lr_ratio: 0.1
+  grad_clip: 5.0
+log_every: 50
+checkpoint_every: 500
+full_eval_steps:
+- 0
+- 1500
+- 3000
+- 6000
+- 12000
+- 18000
+quick_eval_every: 500
+description: Fresh official single-frame VGGT+DPT+pose; RGB/K only, no mapping inputs
+  or public Gaussian memory, no random world gauge. Same fixed split, resolution,
+  18k and exact query episode schedule as Full.
+checkpoint_milestones:
+- 0
+- 3000
+- 18000
+source_full_run: step2_v4_full_seed17
+training_gauge: first_mapping_camera_G_identity
