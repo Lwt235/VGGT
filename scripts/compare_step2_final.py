@@ -37,7 +37,7 @@ def main():
         keep=[i for i,r in enumerate(data[0]['episodes']) if selector(r)]
         for tag,d in zip(tags,data):
             rows=[d['episodes'][i] for i in keep]
-            result[group][tag]={k:stats([r[k] for r in rows]) for k in ['point_epe_m','rotation0_deg','rotation1_deg','translation0_m','translation1_m','camera_epe_m']}
+            result[group][tag]={k:stats([r[k] for r in rows]) for k in ['point_l1_m','point_epe_m','coarse_point_epe_m','rotation0_deg','rotation1_deg','translation0_m','translation1_m','camera_epe_m']}
             if tag=='Full':
                 result[group][tag]['interventions']={key:stats([r['point_epe_m'] if key=='full' else r[key]['point_epe_m'] for r in rows]) for key in ['full','empty_same_weights','mismatched_same_weights','erased_same_weights']}
                 erased=[r['erasure'] for r in rows if r['erasure']['local_pixels'] and r['erasure']['outside_pixels']]

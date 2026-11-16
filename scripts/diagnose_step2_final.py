@@ -36,7 +36,8 @@ def single_frame_unfused(model,observation):
 def metrics(out,t):
     raw=out['raw_camera_points'];truth=transform_points(t.world_points,invert_se3(t.c2w))
     r0,t0=pose_errors(out['T0'],t.c2w);r1,t1=pose_errors(out['T1'],t.c2w)
-    v=dict(point_epe_m=float((out['world_points'][t.valid]-t.world_points[t.valid]).norm(dim=-1).mean()),
+    v=dict(point_l1_m=float((out['world_points'][t.valid]-t.world_points[t.valid]).abs().mean()),
+        point_epe_m=float((out['world_points'][t.valid]-t.world_points[t.valid]).norm(dim=-1).mean()),
         coarse_point_epe_m=float((out['coarse_world_points'][t.valid]-t.world_points[t.valid]).norm(dim=-1).mean()),
         rotation0_deg=float(r0),rotation1_deg=float(r1),translation0_m=float(t0),translation1_m=float(t1),
         camera_epe_m=float((raw[t.valid]-truth[t.valid]).norm(dim=-1).mean()),
