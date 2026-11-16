@@ -37,12 +37,14 @@ def evaluate_run(name, step):
     dataset = EpisodeDataset(PROJECT_ROOT/config['split'], config['image_hw'])
     specs = [s for s in dataset.evaluation_episodes() if s['scene'].startswith('harvard_robotics_lab/')]
     buffers = {label:[] for label in ('near_0.1_3m', 'mid_3_5m', 'far_5_10m')}
-    scatter, poses, attention_stats = [], [], []
+    scatter, poses, attention_stats, calibration_stats = [], [], [], []
     for spec in specs:
         episode = dataset.episode(spec['scene'], spec['mapping_frame_ids'], spec['query_frame_id'], device='cuda')
         query, target = episode['query']
         memory = model.build_memory(episode['mapping'])
         out = model(query, memory, return_attention=True)
+        if 'camera_scale' in out:
+            calibration_stats.append(dict(query=spec['query_frame_id'], gamma=float(out['camera_scale']), confidence_mean=float(out['local_geometry_confidence'].mean())))
         info = out['attention']
         weights = info['attention']
         if weights is not None:
@@ -74,21 +76,22 @@ def evaluate_run(name, step):
                            anchored_depth_bias_m=float(values[:,2].mean()), raw_depth_l1_m=float(np.abs(values[:,1]).mean()), anchored_depth_l1_m=float(np.abs(values[:,2]).mean()))
     del model
     torch.cuda.empty_cache()
-    return dict(pixel_weighted_depth_bins=bins,query_pose=poses,o6_attention=attention_stats), np.concatenate(scatter)
+    return dict(pixel_weighted_depth_bins=bins,query_pose=poses,o6_attention=attention_stats,camera_calibration=calibration_stats), np.concatenate(scatter)
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--old',default='step2_full_seed17');parser.add_argument('--new',default='step2_v2_seed17');parser.add_argument('--step',type=int,default=3000)
+    parser=argparse.ArgumentParser();parser.add_argument('--old',default='step2_full_seed17');parser.add_argument('--new',default='step2_v2_seed17');parser.add_argument('--step',type=int,default=3000);parser.add_argument('--middle')
     args=parser.parse_args()
     if not os.environ.get('VGGT_GPU_MEMORY_FRACTION'): parser.error('Use live GPU launcher')
     torch.set_num_threads(2);torch.cuda.set_per_process_memory_fraction(float(os.environ['VGGT_GPU_MEMORY_FRACTION']))
     results, samples={},{}
-    for tag,name in [('old',args.old),('new',args.new)]:
+    runs=[('full',args.old),('v2',args.middle),('v3',args.new)] if args.middle else [('old',args.old),('new',args.new)]
+    for tag,name in runs:
         results[tag],samples[tag]=evaluate_run(name,args.step)
     folder=PROJECT_ROOT/'results'/args.new
     dump_json(folder/f'robotics_depth_{args.step:05d}.json',results)
-    fig,axes=plt.subplots(2,2,figsize=(10,9),layout='constrained')
-    for row,tag in enumerate(('old','new')):
+    fig,axes=plt.subplots(len(runs),2,figsize=(10,4.5*len(runs)),layout='constrained')
+    for row,(tag,_) in enumerate(runs):
         for col,(index,title) in enumerate(((1,'Native camera depth'),(2,'O5 anchored camera depth'))):
             v=samples[tag];axes[row,col].hexbin(v[:,0],v[:,index],gridsize=55,mincnt=1,cmap='viridis',bins='log')
             axes[row,col].plot([0,10],[0,10],'r--',lw=1)

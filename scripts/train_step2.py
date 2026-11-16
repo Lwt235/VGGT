@@ -60,7 +60,8 @@ def build_optimizer(model, config):
 def criterion(output, target, config):
     return world_loss(output, target, camera_weight=config['camera_alignment_weight'],
         refinement_safety_weight=config['refinement_safety_weight'], anchor_weight=config['anchor_alignment_weight'],
-        matching_weight=config['matching_weight'], depth_weight=config['patch_depth_weight'], relative_depth_weight=config.get('relative_depth_weight', 0.))
+        matching_weight=config['matching_weight'], depth_weight=config['patch_depth_weight'], relative_depth_weight=config.get('relative_depth_weight', 0.),
+        anchored_camera_weight=config.get('anchored_camera_weight', 0.), anchored_relative_depth_weight=config.get('anchored_relative_depth_weight', 0.))
 
 
 def intervention_box(memory, target):
@@ -101,6 +102,8 @@ def evaluate(model, dataset, config, folder, step, *, quick=False, interventions
         wanted_vis = visualize and spec['scene'].split('/')[0] in ('harvard_c5', 'harvard_c6', 'harvard_c11', 'harvard_robotics_lab') and spec['scene'] not in visualized
         full = model(query, memory, return_attention=wanted_vis)
         _, metrics = criterion(full, target, config)
+        if 'camera_scale' in full:
+            metrics.update(camera_scale=float(full['camera_scale']), depth_confidence_mean=float(full['local_geometry_confidence'].mean()))
         item = dict(**spec, **metrics, public_gaussians=len(memory), active_gaussians=len(full['attention']['indices']))
         if interventions:
             empty = model(query, memory.subset(slice(0, 0)))
@@ -227,6 +230,8 @@ def main():
             read_jitter = sample_read_jitter('cuda') if random.random() < config['read_jitter_probability'] and surface_support_rate(memory.means, memory.covars, target) >= .05 else None
             prediction = model(query, memory, read_jitter=read_jitter)
             loss, metrics = criterion(prediction, target, config)
+            if 'camera_scale' in prediction:
+                metrics.update(camera_scale=float(prediction['camera_scale'].detach()), depth_confidence_mean=float(prediction['local_geometry_confidence'].detach().mean()))
             lm = prediction['lm_energy_history']
             metrics.update(lm_energy_initial=float(lm[0]), lm_energy_final=float(lm[-1]), lm_energy_nonincreasing=bool((torch.diff(lm) <= 1e-6).all()))
             if config['mapping_self_observation']:

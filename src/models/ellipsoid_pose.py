@@ -46,9 +46,63 @@ def posterior_ellipsoids(inlier, memory, *, sigma_floor=.03):
     return means, .5*(covariance+covariance.transpose(-1, -2))+sigma_floor**2*eye
 
 
+def symmetric_polar_rotation(matrix, iterations=6):
+    """Three-axis right-handed completion, then matrix-only polar projection.
+
+    One common column scale preserves a symmetric positive camera scatter:
+    normalizing each column independently would introduce a new shear bias.
+    All operations commute with left multiplication by a world rotation.
+    """
+    eye = torch.eye(3, device=matrix.device, dtype=matrix.dtype)
+    scale = matrix.norm(dim=0).max().clamp_min(1e-12)
+    value = matrix/scale
+    a, b, c = value.unbind(-1)
+    cofactor = torch.stack((torch.linalg.cross(b, c), torch.linalg.cross(c, a), torch.linalg.cross(a, b)), -1)
+    completed = value+cofactor
+    # Exact reflections have a non-unique closest proper rotation. The
+    # cofactor provides an equivariant right-handed numerical fallback.
+    completed = torch.where(completed.norm() < 1e-10, cofactor, completed)
+    rotation = completed/completed.norm().clamp_min(1e-12)
+    for _ in range(iterations):
+        rotation = .5*rotation @ (3*eye-rotation.T @ rotation)
+    # Rare highly elongated supports need additional numerical convergence,
+    # never extra data/GT or a different pose objective.
+    for _ in range(6):
+        if float((rotation.T@rotation-eye).detach().abs().max()) < 1e-7:
+            break
+        rotation = .5*rotation @ (3*eye-rotation.T @ rotation)
+    return torch.where(completed.norm() > 1e-10, rotation, eye)
+
+
+def planar_safe_initial(points, anchors, weights, *, whiten=True, iterations=2):
+    """Robust scatter scale + damped centered moments; camera-to-world pose."""
+    eye = torch.eye(3, device=points.device, dtype=points.dtype)
+    votes = weights
+    for step in range(iterations+1):
+        normalized = votes/votes.sum().clamp_min(1e-8)
+        Pbar = (normalized[:, None]*points).sum(0)
+        Xbar = (normalized[:, None]*anchors).sum(0)
+        dP, dX = points-Pbar, anchors-Xbar
+        var_P = (normalized*dP.square().sum(-1)).sum().clamp_min(1e-6)
+        var_X = (normalized*dX.square().sum(-1)).sum()
+        scale = (var_X/var_P).clamp_min(1e-12).sqrt().clamp(.25, 4.)
+        scaled = scale*points
+        dP = scale*dP
+        H = (normalized[:, None]*dX).T @ dP
+        C = (normalized[:, None]*dP).T @ dP
+        lam = .10*C.trace()/3+1e-6
+        matrix = torch.linalg.solve(C+lam*eye, H.T).T if whiten else H
+        R = symmetric_polar_rotation(matrix)
+        t = Xbar-R@(scale*Pbar)
+        if step < iterations:
+            error2 = (anchors-(scaled@R.T+t)).square().sum(-1)
+            votes = weights*.25**2/(.25**2+error2)
+    return R, t, scale, votes
+
+
 def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4,
                           kappa=3., radial_precision=4., damping=.01,
-                          return_diagnostic=False, metric_scale=False):
+                          return_diagnostic=False, metric_scale=False, planar_safe=False):
     # Import locally: the legacy initialization remains available for restoring
     # older project runs, while the v2l update never uses Gram-Schmidt again.
     from src.models.spatial_pose import point_irls_pose
@@ -60,8 +114,14 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
                                             for x in (points, rays, anchors, covars, weights)]
     rays = F.normalize(rays, dim=-1)
     precision = torch.linalg.inv(covars)
-    scatter_scale = points.new_ones(())
-    if metric_scale:
+    planar_candidate = None
+    if planar_safe:
+        Rwhite, twhite, scatter_scale, initial_votes = planar_safe_initial(points, anchors, weights)
+        Rplain, tplain, _, _ = planar_safe_initial(points, anchors, weights, whiten=False)
+        planar_candidate = (Rplain, tplain)
+        points = scatter_scale*points
+    scatter_scale = points.new_ones(()) if not planar_safe else scatter_scale
+    if metric_scale and not planar_safe:
         normalized = weights/weights.sum().clamp_min(1e-8)
         def scatter(value):
             centered = value-(normalized[:, None]*value).sum(0)
@@ -70,8 +130,11 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
         points = scatter_scale*points
     radial = points.norm(dim=-1)
     alpha = .04/(radial+.5).square() if metric_scale else torch.full_like(radial, radial_precision)
-    initial, _ = point_irls_pose(points, anchors, weights, iterations=0)
-    R, t = initial[:3, :3], initial[:3, 3]
+    if planar_safe:
+        R, t = Rwhite, twhite
+    else:
+        initial, _ = point_irls_pose(points, anchors, weights, iterations=0)
+        R, t = initial[:3, :3], initial[:3, 3]
     radial = points.norm(dim=-1)
     eye3 = torch.eye(3, device=points.device, dtype=points.dtype)
 
@@ -87,6 +150,14 @@ def anisotropic_ray_pose(points, rays, anchors, covars, weights, *, iterations=4
         m2 = m2.clamp_min(0)
         energy = (weights*kappa**2*torch.log1p(m2/kappa**2)).sum()
         return depth, residual, m2, energy
+
+    if planar_candidate is not None:
+        plain_R, plain_t = planar_candidate
+        plain_energy = state(plain_R, plain_t)[-1]
+        proper = ((plain_R.T@plain_R-eye3).abs().max() < 1e-5) & (torch.linalg.det(plain_R) > .999)
+        choose_plain = proper & torch.isfinite(plain_energy) & (plain_energy < state(R, t)[-1])
+        R = torch.where(choose_plain, plain_R, R)
+        t = torch.where(choose_plain, plain_t, t)
 
     # One anisotropic center initialization, regularized to a transported
     # centroid prior. Accept only when the SAME robust energy does not rise.

@@ -97,3 +97,13 @@ def test_refinement_safety_compares_read_pose_not_clean_bootstrap():
     _, metrics = world_loss(output, truth, refinement_safety_weight=2.)
     assert metrics['refinement_regression_penalty'] == 0
     assert metrics['translation0_m'] == 0 and metrics['translation_read_m'] > .09
+
+
+def test_v3_final_camera_supervision_trains_anchoring_without_blind_pose_leak():
+    truth,output,t,_,_=example(True)
+    raw=(truth.world_points+.2).requires_grad_()
+    output['raw_camera_points']=raw
+    loss,_=world_loss(output,truth,camera_weight=.05,anchored_camera_weight=.2,anchored_relative_depth_weight=.2)
+    loss.backward()
+    assert raw.grad.abs().sum()>0 and output['camera_points'].grad.abs().sum()>0
+    assert t.grad is None or t.grad.abs()==0

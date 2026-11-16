@@ -59,6 +59,24 @@ class RenderReader(nn.Module):
             nn.init.zeros_(self.depth_confidence[-1].weight)
             nn.init.zeros_(self.depth_confidence[-1].bias)
 
+    def calibrate_camera_scale(self, camera_points, rendered):
+        """Map-only metric scale inside forward, with smooth unseen fallback.
+
+        This is not output/GT alignment: only O5 predictions and native camera
+        points enter. Empty memory gives exactly gamma=1 with finite gradients.
+        """
+        hp, wp = rendered.depth.shape[:2]
+        raw_z = F.adaptive_avg_pool2d(camera_points[..., 2][None, None], (hp, wp))[0, 0, ..., None]
+        rel_var = rendered.depth_variance/rendered.depth.square().clamp_min(.04)
+        valid = (rendered.depth > .05) & (raw_z > .05)
+        weight = rendered.opacity/(1+rel_var)*valid
+        # A small identity pseudo-observation avoids a discontinuous ratio at
+        # zero support and interpolates over total visible weight, not GT.
+        prior = .05
+        gamma = ((weight*rendered.depth).sum()+prior)/((weight*raw_z).sum()+prior)
+        gamma = gamma.clamp(.25, 4.)
+        return gamma*camera_points, gamma
+
     def anchor_camera_geometry(self, camera_points, rendered, K_cv):
         """Local O5 metric depth correction along calibrated camera rays.
 

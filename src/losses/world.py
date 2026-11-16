@@ -140,7 +140,7 @@ def open_set_matching_loss(output, target, erased_reference=None):
     return match, anchor, support_rate, observable
 
 
-def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2, depth_weight=1., relative_depth_weight=0.):
+def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2, depth_weight=1., relative_depth_weight=0., anchored_camera_weight=0., anchored_relative_depth_weight=0.):
     if 'matching_attention' not in output:
         return _legacy_world_loss(output, target, camera_weight=camera_weight, refinement_safety_weight=refinement_safety_weight,
                                   anchor_weight=anchor_weight, matching_weight=matching_weight)
@@ -162,8 +162,15 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
     loss = base+anchor_weight*anchor if observable else camera_weight*camera_delta.abs().mean()
     loss = loss+matching_weight*match+depth_weight*(z_loss+.05*confidence_loss)
     relative_camera = (camera_delta[:, 2].abs()/camera_truth[target.valid][:, 2].clamp_min(.2)).mean()
+    anchored_delta = output['camera_points'][target.valid]-camera_truth[target.valid]
+    anchored_l1 = anchored_delta.abs().mean()
+    anchored_relative = (anchored_delta[:, 2].abs()/camera_truth[target.valid][:, 2].clamp_min(.2)).mean()
     loss = loss+relative_depth_weight*(relative_z+relative_camera)
-    metrics.update(relative_depth_l1=float(relative_z.detach()), relative_camera_depth_l1=float(relative_camera.detach()), loss=float(loss.detach()), anchor_l1_m=float(anchor.detach()), correspondence_loss=float(match.detach()),
+    if anchored_camera_weight:
+        loss = loss+anchored_camera_weight*anchored_l1
+    if anchored_relative_depth_weight:
+        loss = loss+anchored_relative_depth_weight*anchored_relative
+    metrics.update(anchored_camera_l1_m=float(anchored_l1.detach()), anchored_relative_depth_l1=float(anchored_relative.detach()), relative_depth_l1=float(relative_z.detach()), relative_camera_depth_l1=float(relative_camera.detach()), loss=float(loss.detach()), anchor_l1_m=float(anchor.detach()), correspondence_loss=float(match.detach()),
                    surface_support_rate=float(support_rate), world_supervision_enabled=float(observable),
                    z_cam_l1_m=float(z_loss.detach()), camera_epe_m=float(camera_delta.detach().norm(dim=-1).mean()),
                    dustbin_mean=float(output['dustbin_probability'].detach().mean()),

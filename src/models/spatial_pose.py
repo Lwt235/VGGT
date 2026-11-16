@@ -188,11 +188,12 @@ def whitened_irls_pose(camera_points, rays, anchors, weights, *, tau_perp=.08,
 
 class SpatialBootstrap(nn.Module):
     """Memory-independent camera geometry, open-set matches, invariant moments."""
-    def __init__(self, token_dim=1024, latent_dim=256, *, ray_bundle=False, anisotropic=False, metric_scale=False):
+    def __init__(self, token_dim=1024, latent_dim=256, *, ray_bundle=False, anisotropic=False, metric_scale=False, planar_safe=False):
         super().__init__()
         self.ray_bundle = ray_bundle
         self.anisotropic = anisotropic
         self.metric_scale = metric_scale
+        self.planar_safe = planar_safe
         self.key_dropout_mode = 'none'
         self.query_residual = nn.Linear((2 if metric_scale else 1)*token_dim+3, latent_dim)
         self.key_residual = nn.Linear(latent_dim+4, latent_dim)
@@ -264,7 +265,7 @@ class SpatialBootstrap(nn.Module):
             from src.models.ellipsoid_pose import posterior_ellipsoids, anisotropic_ray_pose
             anchors, covariance = posterior_ellipsoids(inlier, memory)
             weights = p_match*c_depth
-            T, votes, lm = anisotropic_ray_pose(points, rays, anchors, covariance, weights, return_diagnostic=True, metric_scale=self.metric_scale)
+            T, votes, lm = anisotropic_ray_pose(points, rays, anchors, covariance, weights, return_diagnostic=True, metric_scale=self.metric_scale, planar_safe=self.planar_safe)
             extras = dict(posterior_covars=covariance, lm_energy_history=lm['energy_history'],
                           lm_accepted_scales=lm['accepted_scales'])
         else:
@@ -285,7 +286,7 @@ class SpatialBootstrap(nn.Module):
 
 
 class SpatialRefinement(nn.Module):
-    def __init__(self, token_dim=2048, *, direct_residual=True, residual_only=False, point_to_plane=False):
+    def __init__(self, token_dim=2048, *, direct_residual=True, residual_only=False, point_to_plane=False, relative_geometry=False):
         super().__init__()
         self.token_project = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, 32), nn.GELU())
         # camera point, rendered point in T0 camera, metric residual, ray, O, var
@@ -293,6 +294,7 @@ class SpatialRefinement(nn.Module):
         self.pose = None if residual_only else PoseHead(64*4*5)
         self.residual_only = residual_only
         self.point_to_plane = point_to_plane
+        self.relative_geometry = relative_geometry
         self.residual_modulator = None
         if residual_only:
             self.residual_modulator = nn.Linear(64*4*5, 3*4*5)
@@ -323,19 +325,21 @@ class SpatialRefinement(nn.Module):
         residual_local = residual_world @ fixed[:3, :3]
         rendered_local = transform_points(rendered.world.reshape(-1, 3), invert_se3(fixed))*opacity
         _, rays, _ = world_rays(K, torch.eye(4, device=K.device), height, width)
-        geometry = torch.cat((camera_patch, rendered_local, residual_local, rays, opacity,
-                              torch.log1p(rendered.depth_variance.reshape(-1, 1))), -1)
+        depth_scale = rendered.depth.reshape(-1, 1).clamp_min(.2) if self.relative_geometry else torch.ones_like(opacity)
+        variance = rendered.depth_variance.reshape(-1, 1)/depth_scale.square()
+        geometry = torch.cat((camera_patch/depth_scale, rendered_local/depth_scale, residual_local/depth_scale, rays, opacity,
+                              torch.log1p(variance)), -1)
         inputs = torch.cat((self.token_project(tokens), geometry), -1).T.reshape(1, 46, height, width)
         spatial = F.adaptive_avg_pool2d(self.spatial(inputs), (4, 5)).flatten()
         delta = torch.eye(4, device=K.device, dtype=K.dtype) if self.pose is None else self.pose(spatial)
         if self.residual_pose is not None:
-            pose_residual = residual_local
+            pose_residual = residual_local/depth_scale
             if self.residual_only:
                 # Mixed depth layers and large correspondence errors should not
                 # dominate one global camera correction. Context may reweight
                 # these metric residuals, but cannot invent a pose on its own.
-                variance_weight = 1/(1+rendered.depth_variance.reshape(-1, 1)/.01)
-                robust_weight = .2/torch.sqrt(residual_local.square().sum(-1, keepdim=True)+.04)
+                variance_weight = 1/(1+variance/.01)
+                robust_weight = .2/torch.sqrt((residual_local/depth_scale).square().sum(-1, keepdim=True)+.04)
                 pose_residual = pose_residual*variance_weight*robust_weight
             residual_grid = (pose_residual/.1).T.reshape(1, 3, height, width)
             residual_vector = F.adaptive_avg_pool2d(residual_grid, (4, 5)).flatten()
@@ -344,5 +348,8 @@ class SpatialRefinement(nn.Module):
             value = self.residual_pose(residual_vector)
             if self.residual_only:
                 value = value+value.new_tensor([1., 0., 0., 0., 1., 0., 0., 0., 0.])
+            if self.relative_geometry:
+                metric_depth = (rendered.depth.reshape(-1, 1)*opacity).sum()/opacity.sum().clamp_min(1e-6)
+                value = torch.cat((value[:6], value[6:]*metric_depth.clamp(.2, 10.)))
             delta = delta @ pose_from_vector(value)
         return fixed @ delta, X_T0.reshape(height, width, 3), residual_world.reshape(height, width, 3)
