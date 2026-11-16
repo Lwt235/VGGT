@@ -33,7 +33,7 @@ def main():
         params=dict(model.named_parameters())
         for k,v in state['trainable'].items():params[k].copy_(v)
         del state
-        dataset=EpisodeDataset(PROJECT_ROOT/c['split'],c['image_hw']);bins={s:[] for s in labels};scatter=[]
+        dataset=EpisodeDataset(PROJECT_ROOT/c['split'],c['image_hw']);bins={s:[] for s in labels};scatter=[];shown=set()
         for index,spec in enumerate(dataset.evaluation_episodes()):
             robotics=spec['scene'].startswith('harvard_robotics_lab/')
             if tag!='Full' and not robotics:continue
@@ -42,6 +42,13 @@ def main():
                 one=model.build_memory(ep['mapping'][:1]);single=model(q,one)
                 r,tr=pose_errors(single['T1'],t.c2w)
                 control.append(dict(**spec,point_epe_m=float((single['world_points'][t.valid]-t.world_points[t.valid]).norm(dim=-1).mean()),rotation_deg=float(r),translation_m=float(tr),gaussians=len(one)))
+                scene=spec['scene']
+                if scene.split('/')[0] in ('harvard_c5','harvard_c6','harvard_c11','harvard_robotics_lab') and scene not in shown:
+                    from src.vis.smoke import v1
+                    path=output/'single_map_frame_vis'/scene.replace('/','__');path.mkdir(parents=True,exist_ok=True)
+                    try:control[-1]['wall']=v1(path,dict(name=ep['name']+' / only first map frame',mapping=ep['mapping']),q,t,single)
+                    except RuntimeError as error:control[-1]['wall_unavailable']=str(error)
+                    shown.add(scene)
                 del one,single
                 if not robotics:continue
                 memory=model.build_memory(ep['mapping']);out=model(q,memory);del memory
