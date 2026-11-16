@@ -44,13 +44,14 @@ def camera_facing_normals(covars, means, center):
 
 
 class RenderReader(nn.Module):
-    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False, camera_frame=False, local_multiplicative=False, physical_local=False):
+    def __init__(self, latent_dim=256, token_dim=1024, *, metric_depth=True, surface_normals=False, camera_frame=False, local_multiplicative=False, physical_local=False, isotropic=False):
         super().__init__()
         self.latent_dim = latent_dim
         self.surface_normals = surface_normals
         self.camera_frame = camera_frame
         self.local_multiplicative = local_multiplicative
         self.physical_local = physical_local
+        self.isotropic = isotropic
         self.project = nn.Sequential(nn.Linear(latent_dim+(8 if camera_frame else 5), token_dim), nn.GELU(), nn.Linear(token_dim, token_dim))
         self.unseen = nn.Parameter(torch.zeros(token_dim))
         self.norm = nn.LayerNorm(token_dim)
@@ -132,11 +133,16 @@ class RenderReader(nn.Module):
             w2c = invert_se3(query_c2w)
             depth = transform_points(memory.means, w2c)[:, 2:3]
             attributes = torch.cat((memory.means, memory.features, depth, depth.square()), -1)
+            covars = memory.covars
+            if self.isotropic:
+                variance = covars.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-10)
+                covars = variance[:, None, None]*torch.eye(3, device=covars.device, dtype=covars.dtype)
             if self.surface_normals:
-                normals = camera_facing_normals(memory.covars, memory.means, query_c2w[:3, 3])
+                normals = (torch.zeros_like(memory.means) if self.isotropic else
+                           camera_facing_normals(covars, memory.means, query_c2w[:3, 3]))
                 attributes = torch.cat((attributes, normals), -1)
             accumulated, opacity, _ = rasterization(
-                means=memory.means, quats=None, scales=None, covars=memory.covars,
+                means=memory.means, quats=None, scales=None, covars=covars,
                 opacities=memory.alpha, colors=attributes, viewmats=w2c[None],
                 Ks=K_patch[None], width=width, height=height, render_mode="RGB", packed=False)
             accumulated, opacity = accumulated[0], opacity[0]
@@ -151,7 +157,8 @@ class RenderReader(nn.Module):
             w2c = invert_se3(query_c2w)
             camera = transform_points(rendered.world, w2c)
             camera = torch.where(rendered.opacity > 1e-6, camera, 0.)
-            normal = rendered.normal @ w2c[:3, :3].T
+            normal = (rendered.normal @ w2c[:3, :3].T if rendered.normal is not None
+                      else torch.zeros_like(camera))
             attributes = torch.cat((camera, normal, rendered.features, torch.log1p(rendered.depth),
                 rendered.depth_variance/(rendered.depth.square()+.05)), -1)
         visible = self.project(attributes.reshape(-1, self.project[0].in_features))

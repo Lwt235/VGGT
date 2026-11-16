@@ -188,12 +188,13 @@ def whitened_irls_pose(camera_points, rays, anchors, weights, *, tau_perp=.08,
 
 class SpatialBootstrap(nn.Module):
     """Memory-independent camera geometry, open-set matches, invariant moments."""
-    def __init__(self, token_dim=1024, latent_dim=256, *, ray_bundle=False, anisotropic=False, metric_scale=False, planar_safe=False):
+    def __init__(self, token_dim=1024, latent_dim=256, *, ray_bundle=False, anisotropic=False, metric_scale=False, planar_safe=False, isotropic=False):
         super().__init__()
         self.ray_bundle = ray_bundle
         self.anisotropic = anisotropic
         self.metric_scale = metric_scale
         self.planar_safe = planar_safe
+        self.isotropic = isotropic
         self.key_dropout_mode = 'none'
         self.query_residual = nn.Linear((2 if metric_scale else 1)*token_dim+3, latent_dim)
         self.key_residual = nn.Linear(latent_dim+4, latent_dim)
@@ -246,8 +247,11 @@ class SpatialBootstrap(nn.Module):
         # Rotation-invariant covariance summaries; no eigen/SVD pose path.
         covariance = memory.covars
         trace = covariance.diagonal(dim1=-2, dim2=-1).sum(-1)
-        invariants = torch.stack((trace/3, covariance.square().sum((-1, -2)).sqrt()/math.sqrt(3),
-                                  torch.linalg.det(covariance).clamp_min(1e-24).pow(1/3)), -1)
+        if self.isotropic:
+            invariants = (trace/3)[:, None].expand(-1, 3)
+        else:
+            invariants = torch.stack((trace/3, covariance.square().sum((-1, -2)).sqrt()/math.sqrt(3),
+                                      torch.linalg.det(covariance).clamp_min(1e-24).pow(1/3)), -1)
         scales = .5*invariants.clamp_min(1e-10).log()
         q = F.normalize(query_features+self.query_residual(torch.cat((tokens_pre_inject, shallow, rays) if self.metric_scale else (shallow, rays), -1)), dim=-1)
         k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
@@ -263,7 +267,7 @@ class SpatialBootstrap(nn.Module):
         extras = {}
         if self.anisotropic:
             from src.models.ellipsoid_pose import posterior_ellipsoids, anisotropic_ray_pose
-            anchors, covariance = posterior_ellipsoids(inlier, memory)
+            anchors, covariance = posterior_ellipsoids(inlier, memory, isotropic=self.isotropic)
             weights = p_match*c_depth
             T, votes, lm = anisotropic_ray_pose(points, rays, anchors, covariance, weights, return_diagnostic=True, metric_scale=self.metric_scale, planar_safe=self.planar_safe)
             extras = dict(posterior_covars=covariance, lm_energy_history=lm['energy_history'],

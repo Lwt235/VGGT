@@ -37,13 +37,17 @@ def sample_read_jitter(device, *, dtype=torch.float32, include_zero=False):
     return torch.cat((torch.cat((R, translation[:, None]), -1), translation.new_tensor([[0., 0., 0., 1.]])), 0)
 
 
-def posterior_ellipsoids(inlier, memory, *, sigma_floor=.03):
+def posterior_ellipsoids(inlier, memory, *, sigma_floor=.03, isotropic=False):
     means = inlier @ memory.means
     delta = memory.means[None]-means[:, None]
     covariance = torch.einsum('qm,mij->qij', inlier, memory.covars)
     covariance = covariance+torch.einsum('qm,qmi,qmj->qij', inlier, delta, delta)
     eye = torch.eye(3, device=means.device, dtype=means.dtype)
-    return means, .5*(covariance+covariance.transpose(-1, -2))+sigma_floor**2*eye
+    covariance = .5*(covariance+covariance.transpose(-1, -2))+sigma_floor**2*eye
+    if isotropic:
+        # Multimodal matching also contributes only scalar uncertainty.
+        covariance = covariance.diagonal(dim1=-2, dim2=-1).mean(-1)[:, None, None]*eye
+    return means, covariance
 
 
 def symmetric_polar_rotation(matrix, iterations=6):

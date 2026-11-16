@@ -71,8 +71,13 @@ def aggregate_single(aggregator, rgb, patch_tokens, injection=None, receive_laye
 
 
 class VGGTSpatialMemory(nn.Module):
-    def __init__(self, source, weights, *, receive_layer=4, revision='v2c', pose_jitter_probability=1.):
+    def __init__(self, source, weights, *, receive_layer=4, revision='v2c', pose_jitter_probability=1., ablation=None):
         super().__init__()
+        if ablation not in (None, 'render_only', 'pe_only', 'isotropic_point') or (ablation and revision != 'step2_v5'):
+            raise ValueError('Step2b ablations require the unchanged v5 architecture')
+        self.ablation = ablation
+        self.use_o5, self.use_o6 = ablation != 'pe_only', ablation != 'render_only'
+        self.isotropic = ablation == 'isotropic_point'
         # No random fallback or automatic download: missing weights stop here.
         if weights is None or not Path(weights).is_file():
             raise FileNotFoundError("Actual official VGGT checkpoint required")
@@ -97,16 +102,24 @@ class VGGTSpatialMemory(nn.Module):
             raise ValueError('Unknown model revision')
         self.revision = revision
         self.pose_jitter_probability = pose_jitter_probability
-        self.writer = TokenGaussianWriter(2048 if revision in ('step2_v4', 'step2_v5') else 1024)
-        self.fusion = SpatialMomentFusion()
+        self.writer = TokenGaussianWriter(2048 if revision in ('step2_v4', 'step2_v5') else 1024, isotropic=self.isotropic)
+        self.fusion = SpatialMomentFusion(isotropic=self.isotropic)
         self.render_reader = RenderReader(metric_depth=revision!='v2', surface_normals=revision in ('step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), camera_frame=revision in ('step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), local_multiplicative=revision=='step2_v4', physical_local=revision=='step2_v5')
         self.pe_reader = ParameterPEReader(opacity_occlusion=revision!='v2', camera_frame=revision in ('step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'))
+        if self.isotropic:
+            self.render_reader.isotropic = True
+            self.pe_reader.isotropic = True
+        if not self.use_o5:
+            self.render_reader = None
+        if not self.use_o6:
+            self.pe_reader = None
         self.initial_pose = SpatialBootstrap(ray_bundle=revision in ('v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), anisotropic=revision in ('v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), metric_scale=revision in ('step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), planar_safe=revision in ('step2_v3', 'step2_v4', 'step2_v5')) if revision in ('v2j', 'v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5') else LegacySpatialBootstrap(local_rotation=revision!='v2', robust_voting=revision in ('v2g', 'v2h', 'v2i'))
         self.refine_pose = SpatialRefinement(direct_residual=revision in ('v2c', 'v2g', 'v2h', 'v2i', 'v2j', 'v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), residual_only=revision in ('v2i', 'v2j', 'v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), point_to_plane=revision in ('step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'), relative_geometry=revision in ('step2_v3', 'step2_v4', 'step2_v5'), confidence_gate=revision=='step2_v4')
 
         if revision == 'step2_v5':
             from src.models.deep_refinement import DeepEllipsoidRefinement
-            self.refine_pose = DeepEllipsoidRefinement()
+            self.refine_pose = DeepEllipsoidRefinement(isotropic=self.isotropic)
+            self.initial_pose.isotropic = self.isotropic
 
     def train(self, mode=True):
         super().train(mode)
@@ -172,9 +185,17 @@ class VGGTSpatialMemory(nn.Module):
                                                      memory, Kp, hp, wp, shallow=shallow[0].float())
                     diagnostic.update(bootstrap)
                 T0_read = T0 if read_jitter is None else T0.detach() @ read_jitter
-                read, rendered = self.render_reader(tokens.float(), memory, T0_read, Kp, hp, wp)
-                read, attention = self.pe_reader(read, memory, T0_read, Kp, hp, wp, rendered.depth,
-                                                 rendered=rendered, return_attention=return_attention)
+                read, rendered = tokens.float(), None
+                if self.render_reader is not None:
+                    read, rendered = self.render_reader(read, memory, T0_read, Kp, hp, wp)
+                if self.pe_reader is not None:
+                    read, attention = self.pe_reader(read, memory, T0_read, Kp, hp, wp,
+                        None if rendered is None else rendered.depth,
+                        rendered=rendered, return_attention=return_attention)
+                else:
+                    from src.readout.parameter_pe import active_memory
+                    _, indices = active_memory(memory, T0_read, Kp, hp, wp, isotropic=self.isotropic)
+                    attention = dict(indices=indices, attention=None, disabled=True)
             diagnostic.update(rendered=rendered, attention=attention)
             return read
         with torch.autocast(device_type=rgb.device.type, dtype=torch.bfloat16, enabled=rgb.is_cuda):
@@ -212,7 +233,7 @@ class VGGTSpatialMemory(nn.Module):
             else:
                 T1, X_T0, residual = self.refine_pose(final, refinement_points if self.revision in ('v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5') else camera_points,
                                                     T0_read, diagnostic['rendered'], Kp, hp, wp)
-            if self.revision in ('step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'):
+            if self.render_reader is not None and self.revision in ('step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'):
                 final_pose = T1.detach() if self.revision in ('step2_v3', 'step2_v4', 'step2_v5') else T1
                 rendered_T1 = self.render_reader.render(memory, final_pose, Kp, hp, wp)
                 camera_points, local_confidence = self.render_reader.anchor_camera_geometry(raw_camera_points if self.revision in ('step2_v4', 'step2_v5') else refinement_points, rendered_T1, K)
@@ -225,4 +246,5 @@ class VGGTSpatialMemory(nn.Module):
         return {"world_points": points, "coarse_world_points": coarse_points, "camera_points": camera_points, **raw_geometry,
                 "X_T0_patch": X_T0, "alignment_residual": residual, "T0": T0, "T1": T1,
                 "anchor_support_means": memory.means, "anchor_support_covars": memory.covars,
-                "local_geometry_confidence": local_confidence, **diagnostic}
+                "local_geometry_confidence": local_confidence, "patch_hw": (hp, wp),
+                "o5_enabled": self.render_reader is not None, "o6_enabled": self.pe_reader is not None, **diagnostic}

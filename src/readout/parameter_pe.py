@@ -14,7 +14,7 @@ def center_pe(means: Tensor, bands=8):
     return torch.cat((phase.sin(), phase.cos()), -1).flatten(-2)
 
 
-def active_memory(memory, query_c2w, K, height, width, *, budget=2048, margin=.25):
+def active_memory(memory, query_c2w, K, height, width, *, budget=2048, margin=.25, isotropic=False):
     """Read budget is separate from stored memory; functional view only.
 
     Conservative 3-sigma bounding sphere protects off-screen ellipsoid overlap.
@@ -25,7 +25,9 @@ def active_memory(memory, query_c2w, K, height, width, *, budget=2048, margin=.2
     with torch.no_grad():
         camera = transform_points(memory.means, invert_se3(query_c2w))
         z = camera[:, 2]
-        radius = 3*torch.linalg.eigvalsh(memory.covars)[:, -1].clamp_min(1e-10).sqrt()
+        variance = (memory.covars.diagonal(dim1=-2, dim2=-1).mean(-1) if isotropic
+                    else torch.linalg.eigvalsh(memory.covars)[:, -1])
+        radius = 3*variance.clamp_min(1e-10).sqrt()
         image = camera @ K.T
         xy = image[:, :2] / z[:, None].clamp_min(1e-5)
         radius_pixels = K[:2, :2].diag().max()*radius/(z-radius).clamp_min(1e-3)
@@ -41,13 +43,14 @@ def active_memory(memory, query_c2w, K, height, width, *, budget=2048, margin=.2
 
 
 class ParameterPEReader(nn.Module):
-    def __init__(self, token_dim=1024, latent_dim=256, heads=8, bands=8, *, opacity_occlusion=True, camera_frame=False):
+    def __init__(self, token_dim=1024, latent_dim=256, heads=8, bands=8, *, opacity_occlusion=True, camera_frame=False, isotropic=False):
         super().__init__()
         if token_dim % heads:
             raise ValueError("token_dim must divide heads")
         self.heads, self.bands = heads, bands
         self.opacity_occlusion = opacity_occlusion
         self.camera_frame = camera_frame
+        self.isotropic = isotropic
         self.query = nn.Linear(token_dim, token_dim)
         self.query_geometry = nn.Linear(6*bands+6, token_dim, bias=False)
         self.key = nn.Linear(latent_dim+6*bands, token_dim)
@@ -60,9 +63,10 @@ class ParameterPEReader(nn.Module):
         self.beta = nn.Parameter(torch.full((heads,), 1.))
 
     def forward(self, tokens: Tensor, memory: GaussianMemory, query_c2w: Tensor,
-                K_patch: Tensor, height: int, width: int, render_depth: Tensor,
+                K_patch: Tensor, height: int, width: int, render_depth: Tensor | None = None,
                 *, rendered=None, active_budget=2048, query_chunk=128, return_attention=False):
-        selected, indices = active_memory(memory, query_c2w, K_patch, height, width, budget=active_budget)
+        selected, indices = active_memory(memory, query_c2w, K_patch, height, width,
+                                          budget=active_budget, isotropic=self.isotropic)
         if len(selected) == 0:
             return tokens, {"indices": indices, "attention": None}
         nquery, channels = tokens.shape
@@ -77,9 +81,15 @@ class ParameterPEReader(nn.Module):
             origins, directions, camera_dz = world_rays(K_patch, torch.eye(4, device=tokens.device, dtype=tokens.dtype), height, width)
             if rendered is not None:
                 rendered_world = transform_points(rendered.world, w2c)
-        eigenvalues, eigenvectors = torch.linalg.eigh(covars)
-        log_scales = eigenvalues.clamp_min(1e-10).sqrt().log()
-        normals = eigenvectors[..., 0]
+        if self.isotropic:
+            # A point sphere exposes one physical size, never an orientation or
+            # anisotropic shape, even if its input covariance is not spherical.
+            variance = covars.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-10)
+            log_scales = variance.sqrt().log()[:, None].expand(-1, 3)
+        else:
+            eigenvalues, eigenvectors = torch.linalg.eigh(covars)
+            log_scales = eigenvalues.clamp_min(1e-10).sqrt().log()
+            normals = eigenvectors[..., 0]
         position = tokens.new_zeros(nquery, 6*self.bands)
         if rendered is not None:
             position = center_pe(rendered_world.reshape(-1, 3), self.bands)*rendered.opacity.reshape(-1, 1)
@@ -91,13 +101,24 @@ class ParameterPEReader(nn.Module):
         chunks, attention = [], []
         for start in range(0, nquery, query_chunk):
             stop = min(start+query_chunk, nquery)
-            rho2, t = ray_ellipsoid_distance(origins[start:stop], directions[start:stop],
-                                             means, covars)
+            if self.isotropic:
+                delta = means[None]-origins[start:stop, None]
+                ray = directions[start:stop, None]
+                t = ((delta*ray).sum(-1)/ray.square().sum(-1).clamp_min(1e-10)).clamp_min(0)
+                rho2 = (t[..., None]*ray-delta).square().sum(-1)/variance[None]
+            else:
+                rho2, t = ray_ellipsoid_distance(origins[start:stop], directions[start:stop],
+                                                 means, covars)
             closest_z = t*camera_dz[start:stop, None]
-            relative_z = closest_z-render_depth.reshape(-1)[start:stop, None]
-            if rendered is not None and self.opacity_occlusion:
-                relative_z = relative_z*rendered.opacity.reshape(-1)[start:stop, None]
-            normal_cos = torch.abs(directions[start:stop] @ normals.T)
+            # PE-only reads have no O5 depth/opacity surrogate. Camera rays and
+            # stored centers still supply their independent physical prior.
+            relative_z = torch.zeros_like(closest_z)
+            if render_depth is not None:
+                relative_z = closest_z-render_depth.reshape(-1)[start:stop, None]
+                if rendered is not None and self.opacity_occlusion:
+                    relative_z = relative_z*rendered.opacity.reshape(-1)[start:stop, None]
+            normal_cos = (torch.zeros_like(closest_z) if self.isotropic
+                          else torch.abs(directions[start:stop] @ normals.T))
             shape = log_scales[None].expand(stop-start, -1, -1)
             geometry = torch.cat((torch.log1p(rho2)[..., None], torch.log1p(closest_z)[..., None],
                                   torch.tanh(relative_z/2.)[..., None], normal_cos[..., None], shape,

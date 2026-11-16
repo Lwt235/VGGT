@@ -41,7 +41,7 @@ def build_optimizer(model, config):
         used.update(id(p) for p in values)
         if values:
             groups.append(dict(params=values, lr=lr, weight_decay=decay))
-    add([model.render_reader.gate, model.pe_reader.gate], opt['gate_lr'], 0)
+    add([reader.gate for reader in (model.render_reader, model.pe_reader) if reader is not None], opt['gate_lr'], 0)
     add([model.initial_pose.dustbin_logit], opt['dustbin_lr'], 0)
     add(model.initial_pose.dustbin_head.parameters(), opt['dustbin_head_lr'])
     add(model.initial_pose.parameters(), opt['bootstrap_lr'])

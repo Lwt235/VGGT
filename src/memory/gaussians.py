@@ -40,18 +40,21 @@ class TokenGaussianWriter(nn.Module):
     Cell centers are lifted once per token, without pixel-level densification.
     """
 
-    def __init__(self, token_dim, latent_dim=256, patch_size=14):
+    def __init__(self, token_dim, latent_dim=256, patch_size=14, *, isotropic=False):
         super().__init__()
         self.patch_size = patch_size
         self.latent_dim = latent_dim
-        self.geometry = nn.Linear(token_dim, 11)  # delta xyz, delta log s, q, alpha
+        self.isotropic = isotropic
+        # The spherical ablation has exactly one scale and no orientation head.
+        self.geometry = nn.Linear(token_dim, 5 if isotropic else 11)
         self.latent = nn.Linear(token_dim, latent_dim)
         nn.init.normal_(self.geometry.weight, std=.001)
         nn.init.zeros_(self.geometry.bias)
-        with torch.no_grad():
-            self.geometry.bias[6] = 1.  # WXYZ identity
-        # Non-degenerate local ellipsoids; z is thinner than x/y.
-        self.register_buffer("base_shape", torch.tensor([1., .8, .25]))
+        if not isotropic:
+            with torch.no_grad():
+                self.geometry.bias[6] = 1.  # WXYZ identity
+            # Non-degenerate local ellipsoids; z is thinner than x/y.
+            self.register_buffer("base_shape", torch.tensor([1., .8, .25]))
 
     def forward(self, tokens: Tensor, mapping_depth: Tensor, K_patch: Tensor,
                 mapping_c2w: Tensor, valid_mask=None) -> GaussianMemory:
@@ -74,11 +77,18 @@ class TokenGaussianWriter(nn.Module):
         means = unproject(mapping_depth, K_patch, mapping_c2w, center=.5).reshape(-1, 3)
         delta_cam = torch.tanh(raw[:, :3]) * radius[:, None]
         means = means + delta_cam @ mapping_c2w[:3, :3].T
-        scale = radius[:, None] * self.base_shape * torch.exp(.7*torch.tanh(raw[:, 3:6]))
-        cov_cam = covariance_from_quat_scale(raw[:, 6:10], scale.clamp_min(1e-4))
-        R = mapping_c2w[:3, :3]
-        covars = R @ cov_cam @ R.T
-        return GaussianMemory(means, covars, torch.sigmoid(raw[:, 10]), self.latent(tokens)).subset(valid_mask.reshape(-1))
+        if self.isotropic:
+            scale = (radius*torch.exp(.7*torch.tanh(raw[:, 3]))).clamp_min(1e-4)
+            # A sphere is unchanged by the mapping rotation. Construct it
+            # directly so even roundoff cannot encode an orientation.
+            eye = torch.eye(3, device=scale.device, dtype=scale.dtype)
+            covars = scale.square()[:, None, None]*eye
+        else:
+            scale = radius[:, None] * self.base_shape * torch.exp(.7*torch.tanh(raw[:, 3:6]))
+            cov_cam = covariance_from_quat_scale(raw[:, 6:10], scale.clamp_min(1e-4))
+            R = mapping_c2w[:3, :3]
+            covars = R @ cov_cam @ R.T
+        return GaussianMemory(means, covars, torch.sigmoid(raw[:, -1]), self.latent(tokens)).subset(valid_mask.reshape(-1))
 
 
 class SpatialMomentFusion(nn.Module):
@@ -89,10 +99,11 @@ class SpatialMomentFusion(nn.Module):
     Voxel size is derived from local physical scale; normals are unoriented.
     """
 
-    def __init__(self, min_cell=.02, normal_cos=.8):
+    def __init__(self, min_cell=.02, normal_cos=.8, *, isotropic=False):
         super().__init__()
         self.min_cell = min_cell
         self.normal_cos = normal_cos
+        self.isotropic = isotropic
         self.feature_gate = nn.Parameter(torch.tensor(0.))
         self.opacity_gate = nn.Parameter(torch.tensor(0.))
 
@@ -100,9 +111,13 @@ class SpatialMomentFusion(nn.Module):
         if len(memory) == 0:
             return memory
         with torch.no_grad():
-            eigenvalues, eigenvectors = torch.linalg.eigh(memory.covars.detach())
             # Quantized physical scale bands avoid a single global spatial cell.
-            size = (2*eigenvalues[:, 1].clamp_min(1e-10).sqrt()).clamp_min(self.min_cell)
+            if self.isotropic:
+                variance = memory.covars.detach().diagonal(dim1=-2, dim2=-1).mean(-1)
+            else:
+                eigenvalues, eigenvectors = torch.linalg.eigh(memory.covars.detach())
+                variance = eigenvalues[:, 1]
+            size = (2*variance.clamp_min(1e-10).sqrt()).clamp_min(self.min_cell)
             band = torch.floor(torch.log2(size/self.min_cell))
             cell_size = self.min_cell * torch.pow(2., band)
             # Anchor only the discrete hash grid to the first mapping camera.
@@ -113,14 +128,14 @@ class SpatialMomentFusion(nn.Module):
                 hash_means = transform_points(hash_means, invert_se3(reference_c2w.detach()))
             cells = torch.floor(hash_means/cell_size[:, None]).long()
             keys = torch.cat((band.long()[:, None], cells), -1).cpu().tolist()
-            normals = eigenvectors[..., 0].cpu().numpy()
+            normals = None if self.isotropic else eigenvectors[..., 0].cpu().numpy()
             buckets = {}
             groups = []
             for i, key in enumerate(keys):
                 candidate_groups = buckets.setdefault(tuple(key), [])
                 for group_idx in candidate_groups:
                     first = groups[group_idx][0]
-                    if abs(normals[first] @ normals[i]) >= self.normal_cos:
+                    if self.isotropic or abs(normals[first] @ normals[i]) >= self.normal_cos:
                         groups[group_idx].append(i)
                         break
                 else:
@@ -141,6 +156,10 @@ class SpatialMomentFusion(nn.Module):
         covars = total(weights[:, None, None]*(memory.covars+delta[:, :, None]*delta[:, None, :]))
         covars = (covars+covars.transpose(-1, -2))*.5
         covars = covars+torch.eye(3, device=covars.device, dtype=covars.dtype)*1e-8
+        if self.isotropic:
+            # Include between-center spread, then remove ALL anisotropy.
+            covars = covars.diagonal(dim1=-2, dim2=-1).mean(-1)[:, None, None]*torch.eye(
+                3, device=covars.device, dtype=covars.dtype)
         feature_mean = total(weights[:, None]*memory.features)
         first = torch.tensor([group[0] for group in groups], device=memory.means.device)
         features = torch.lerp(memory.features[first], feature_mean, self.feature_gate.sigmoid())

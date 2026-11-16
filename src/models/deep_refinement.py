@@ -11,8 +11,9 @@ from src.models.ellipsoid_pose import anisotropic_ray_pose, posterior_ellipsoids
 
 
 class DeepEllipsoidRefinement(nn.Module):
-    def __init__(self, token_dim=2048, latent_dim=256):
+    def __init__(self, token_dim=2048, latent_dim=256, *, isotropic=False):
         super().__init__()
+        self.isotropic = isotropic
         self.query_delta = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, latent_dim))
         self.dustbin_delta = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, 1))
         for head in (self.query_delta, self.dustbin_delta):
@@ -34,7 +35,7 @@ class DeepEllipsoidRefinement(nn.Module):
         W = torch.cat((logits, dustbin), -1).softmax(-1)
         p_match = 1-W[:, -1]
         inlier = W[:, :-1]/p_match[:, None].clamp_min(1e-6)
-        anchors, covars = posterior_ellipsoids(inlier, memory)
+        anchors, covars = posterior_ellipsoids(inlier, memory, isotropic=self.isotropic)
         rays = bootstrap['camera_rays']
         # init_pose mode eliminates radial reference from MAP/pose/rays only;
         # these placeholder points supply shape, never any monocular depths.

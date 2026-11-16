@@ -6,6 +6,11 @@ from torch.nn import functional as F
 from src.geometry import invert_se3, transform_points
 
 
+def patch_shape(output):
+    # PE-only has no O5 tensors: grid dimensions come from the query adapter.
+    return output['patch_hw'] if output.get('rendered') is None else output['rendered'].opacity.shape[:2]
+
+
 def rotation_geodesic(prediction, target):
     relative = prediction.transpose(-1, -2) @ target
     skew = torch.stack((relative[..., 2, 1]-relative[..., 1, 2], relative[..., 0, 2]-relative[..., 2, 0],
@@ -35,7 +40,7 @@ def _legacy_world_loss(output, target, *, camera_weight=.5, refinement_safety_we
     coarse_point = (output['coarse_world_points'][valid]-target.world_points[valid]).abs().mean()
     # Explicit patch-anchor supervision, evaluator/criterion only. It teaches
     # correspondences rather than feeding any query geometry to the model.
-    hp, wp = output['rendered'].opacity.shape[:2]
+    hp, wp = patch_shape(output)
     valid_patch = F.adaptive_avg_pool2d(valid.float()[None, None], (hp, wp))[0, 0]
     world_patch = F.adaptive_avg_pool2d((target.world_points*valid[..., None]).permute(2, 0, 1)[None], (hp, wp))[0].permute(1, 2, 0)/valid_patch.clamp_min(1e-6)[..., None]
     anchor_mask = valid_patch.flatten() > .25
@@ -94,7 +99,7 @@ def surface_support_rate(means, covars, target):
 
 def open_set_matching_loss(output, target, erased_reference=None):
     """GT surface support and positive/negative labels live ONLY in criterion."""
-    h, w = output['rendered'].opacity.shape[:2]
+    h, w = patch_shape(output)
     valid = target.valid
     fraction = F.adaptive_avg_pool2d(valid.float()[None, None], (h, w))[0, 0]
     patch_valid = fraction.flatten() > .25
@@ -151,7 +156,7 @@ def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0.,
     if 'refined_matching_attention' in output:
         refined_output = dict(output, matching_attention=output['refined_matching_attention'], anchors=output['refined_anchors'])
         refined_match, _, _, _ = open_set_matching_loss(refined_output, target)
-    hp, wp = output['rendered'].opacity.shape[:2]
+    hp, wp = patch_shape(output)
     valid = target.valid.float()
     fraction = F.adaptive_avg_pool2d(valid[None, None], (hp, wp))[0, 0].flatten()
     depth = (F.adaptive_avg_pool2d((target.depth*valid)[None, None], (hp, wp))[0, 0].flatten()/fraction.clamp_min(1e-6))

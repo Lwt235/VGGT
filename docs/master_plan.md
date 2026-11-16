@@ -265,3 +265,15 @@ Full从授权v5 3000步完整状态续至18000，No-Memory从官方重新初始�
 四场景Full最终V1–V5、三方V1/截面、曲线、四干预和深度图均已实际打开审阅；最终REQUIRE_GSPLAT=1测试83/83，训练/诊断子进程均完成，未操作他人进程。Full跨场景6k后平台，T1仍略负增益；robotics远距EPE虽优于No-Memory（1.2138 vs3.7744m），仍偏浅且较3k回退，362和留出大角度长尾未解决。
 
 完整结果见docs/step2_main_report.md及四份定量/深度补充。已按预算完成本轮主对比并停下汇报；Render-Only、PE-Only、Isotropic-Point和Step3均未启动，等待用户确认后决定下一步。
+
+### Step2b：三项18k核心消融（2026-11-17已授权）
+
+三个新目录为step2_ablation_render_only_seed17、step2_ablation_pe_only_seed17、step2_ablation_isotropic_point_seed17。全部官方VGGT全新初始化，保留v5对称上下文、T0/T1、随机世界规范与训练准则，原split/168×224/seed17及AdamW日程完全一致。独立重放Full全部18000步episode、相同世界变换与读入扰动，0/1500/3000/6000/12000/18000固定126查询评测。
+
+RO移除O6；PE移除O5特征读取/建图光栅损失/最终锚定，最终相机点为raw点，O6仅用自身预测相机射线；因无锚定，PE不叠加锚定专属的重复相机监督。Point使用单尺度球Writer、无方向体素融合、融合/后验总矩trace/3投影球、O5零法向、O6零法向余弦和单尺度，所有普通潜特征仍只来自视觉上下文，避免重根特征分解。
+
+Full未逐步保存增强矩阵，因此仅从其初始Python/CUDA RNG元数据和已存随机分支恢复增强；恢复脚本不载入Full参数初始化任何模型。重放Python采样身份及全部已存1500/3000/6000/12000/13000/18000随机状态，生成新协议目录augmentation_replay.pt；三组读取同一增强数据。配对擦除请求/半径共用Full计划，中心由各自当前记忆与注意力选择，当前criterion盲区保护保留。
+
+原Full/No-Memory/Single缓存全部只读。根盘约剩3.8GiB，三组每500步原子替换各自latest完整状态、仅18k保留里程碑hardlink，共享锁串行写盘避免多份tmp峰值；所有指定里程碑评测照常保存。消融本来可能提高EPE，不用Full的0.50m阈值裁掉弱组件；保留非有限与活动模块持续断梯度门禁。实时检查空闲卡，最多三张不同卡并行，单进程cap约7.7GiB、实际峰值另记；其他卡满载则顺序或等待，不信号他人进程。
+
+最终新目录step2b_matrix_seed17汇总Full/No-Memory/Single-map/RO/PE/Point六方世界EPE/L1、两级位姿、相机几何、robotics近中远分桶、盲区与尾例、完整训练/验证曲线、四场景V1/V2。新三组V1/V2及六方拼图均实际打开审阅，严格测试和自有GPU任务退出后提交报告。Step3尚未授权。
