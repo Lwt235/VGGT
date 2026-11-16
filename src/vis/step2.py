@@ -69,12 +69,12 @@ def dump_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False)+'\n')
 
 
-def causal_summary(folder, evaluation):
+def causal_summary(folder, evaluation, *, observable=None):
     fig, axes = plt.subplots(2, 2, figsize=(11, 7), layout='constrained')
     conditions = ('full', 'empty_same_weights', 'mismatched_same_weights', 'erased_same_weights')
     labels = ('Full', 'Empty', 'Mismatch', '3D erased')
     for row, group in enumerate(('cross_scene_val', 'same_scene_heldout')):
-        rows = [r for r in evaluation['episodes'] if r['split']==group and r['surface_support_rate'] >= .05]
+        rows = [r for r in evaluation['episodes'] if r['split']==group and (observable(r) if observable is not None else r['surface_support_rate'] >= .05)]
         values = [np.mean([r['point_epe_m'] if key=='full' else r[key]['point_epe_m'] for r in rows]) for key in conditions]
         axes[row, 0].bar(labels, values, color=['#0072b2', '#999999', '#cc79a7', '#d55e00'])
         axes[row, 0].set(title=group+': same weights, no retraining', ylabel='Unaligned world EPE [m]')

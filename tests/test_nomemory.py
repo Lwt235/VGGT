@@ -31,3 +31,13 @@ def test_single_frame_baseline_interface_and_pose_depth_gradient_separation(monk
     with pytest.raises(TypeError):model(q,object())
     gt=Supervision(torch.ones(28,42),torch.eye(4),torch.zeros(28,42,3),torch.ones(28,42,dtype=torch.bool))
     with pytest.raises(TypeError,match='RGB|QueryInput'):model(gt)
+
+
+def test_benchmark_membership_cannot_be_changed_by_learned_covariance():
+    from src.evaluation import benchmark_observable
+    scene={'s':dict(frame_ids=[1,2,3],surface_overlap=[[0,.4,.5],[.4,0,.2],[.5,.2,0]])}
+    query=dict(scene='s',query_frame_id=3,mapping_frame_ids=[1,2],surface_support_rate=0.)
+    assert benchmark_observable(query,scene)
+    scene['s']['surface_overlap'][2]=[0.,0.,0.]
+    query['surface_support_rate']=1.
+    assert not benchmark_observable(query,scene)

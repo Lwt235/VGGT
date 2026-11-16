@@ -17,6 +17,7 @@ from src.step2_data import EpisodeDataset
 from src.geometry import invert_se3,transform_points
 from src.losses.world import pose_errors,rotation_geodesic
 from src.models.nomemory_vggt import VGGTNoMemory
+from src.evaluation import benchmark_observable
 from src.vis.step2 import dump_json,curves
 from scripts.train_smoke import gradient_norm
 
@@ -52,12 +53,13 @@ def evaluate(model,dataset,config,folder,step,reference,*,quick=False,visualize=
         query,target=episode['query']
         output=model(query)
         support=label['surface_support_rate']
-        _,metrics=query_loss(output,target,config,observable=support>=.05)
-        records.append(dict(**spec,**metrics,surface_support_rate=support,reference_support='fixed final Full evaluation grouping'))
+        observable=benchmark_observable(spec,{sid:item for sid,(_,item) in dataset.scenes.items()})
+        _,metrics=query_loss(output,target,config,observable=observable)
+        records.append(dict(**spec,**metrics,surface_support_rate=support,benchmark_observable=observable,reference_support='original fixed RGB-D overlap; learned Full 3sigma support reported separately'))
         if visualize and spec['scene'].split('/')[0] in ('harvard_c5','harvard_c6','harvard_c11','harvard_robotics_lab') and spec['scene'] not in shown:
             from src.vis.smoke import v1,save,cloud,COLD,ORANGE
             path=folder/'vis'/f'step_{step:05d}'/spec['scene'].replace('/','__');path.mkdir(parents=True,exist_ok=True)
-            try:v1(path,dict(name=episode['name'],mapping=episode['mapping']),query,target,output)
+            try:records[-1]['wall']=v1(path,dict(name=episode['name'],mapping=episode['mapping']),query,target,output)
             except RuntimeError as error:
                 import matplotlib.pyplot as plt
                 fig,ax=plt.subplots(figsize=(6,5),layout='constrained')
@@ -71,8 +73,8 @@ def evaluate(model,dataset,config,folder,step,reference,*,quick=False,visualize=
         del episode,output
     groups=[]
     for group in ('cross_scene_val','same_scene_heldout'):
-        selected=[r for r in records if r['split']==group and r['surface_support_rate']>=.05]
-        blind=[r for r in records if r['split']==group and r['surface_support_rate']<.05]
+        selected=[r for r in records if r['split']==group and r['benchmark_observable']]
+        blind=[r for r in records if r['split']==group and not r['benchmark_observable']]
         keys=('point_epe_m','coarse_point_epe_m','rotation0_deg','rotation1_deg','translation0_m','translation1_m','camera_epe_m','surface_support_rate')
         groups.append(dict(step=step,scope='quick' if quick else 'full',group=group,queries=len(selected),blind_queries=len(blind),
                            **{key:float(np.mean([r[key] for r in selected])) for key in keys}))
