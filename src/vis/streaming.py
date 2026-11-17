@@ -152,6 +152,12 @@ def training_curves(folder, rows):
         ax.plot([r['step'] for r in values],[r[key] for r in values],alpha=.3)
         if len(values)>=40:
             ax.plot([r['step'] for r in values][39:],np.convolve([r[key] for r in values],np.ones(40)/40,'valid'))
+        parallel=[r for r in rows if r.get('distributed_world_size',1)>1]
+        if parallel:
+            first=parallel[0]
+            ax.axvline(first['step'],color='#8b4a9c',ls='--',lw=1)
+            ax.text(first['step'],.97,f"DDP: {first['distributed_world_size']} trajectories/update",
+                transform=ax.get_xaxis_transform(),ha='right',va='top',fontsize=7,color='#8b4a9c')
         ax.set(title=key,xlabel='Streaming optimizer updates')
     fig.suptitle('Step 3 · train scenes only, heldout frames excluded')
     save(fig,folder/'stream_training_curves.png')

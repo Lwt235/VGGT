@@ -82,6 +82,7 @@ def test_training_curve_includes_actual_logged_write_confidence(tmp_path):
     from src.vis.streaming import training_curves
     data=[dict(step=i,loss=1/i,point_epe_m=.5/i,mean_write_confidence=.3+i*.001)
           for i in range(1,81)]
+    for row in data[60:]:row['distributed_world_size']=3
     training_curves(tmp_path/'new_training_directory',data)
     assert (tmp_path/'new_training_directory'/'stream_training_curves.png').stat().st_size>20000
 
