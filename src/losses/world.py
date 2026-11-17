@@ -110,9 +110,13 @@ def open_set_matching_loss(output, target, erased_reference=None):
             precision = torch.linalg.inv(covars)
             diff = world.reshape(-1, 3)[:, None]-means[None]
             rho2 = torch.einsum('qmi,mij,qmj->qm', diff, precision, diff)
+            selected = output.get('matching_mask')
+            if selected is not None:
+                rho2 = rho2.masked_fill(~selected[None], float('inf'))
             minimum = rho2.min(-1).values
             teacher = (-rho2/2).softmax(-1)
-            support_rate = surface_support_rate(means, covars, target)
+            support_rate = surface_support_rate(means if selected is None else means[selected],
+                                               covars if selected is None else covars[selected], target)
         else:
             minimum = world.new_full((h*w,), float('inf'))
             teacher = world.new_zeros(h*w, 0)
