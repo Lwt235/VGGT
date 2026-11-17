@@ -82,6 +82,17 @@ class StreamingEngine(nn.Module):
         if not hasattr(self.model, 'stream_pose_gate'):
             self.model.stream_pose_gate = StreamPoseGate()
 
+    def train(self, mode=True):
+        super().train(mode)
+        native=getattr(self.model,'native',None)
+        if mode and native is not None and not any(p.requires_grad for p in native.parameters()):
+            # Official Aggregator uses ONLY this parent flag to select
+            # checkpoint-vs-direct execution. Preserve every child block's
+            # training/dropout flag and all input gradients; avoid needless
+            # recomputation with a frozen native network at this token count.
+            native.aggregator.training=False
+        return self
+
     def read(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False):
         """Same conservative read for fixed-state counterfactuals; no write."""
         output = self.model(query, memory, return_attention=return_attention, streaming=True)

@@ -131,3 +131,40 @@ def test_stream_gate_accepts_cpu_double_lm_diagnostic_on_cuda():
     assert pose.is_cuda and gain.is_cuda and 0 < gain < 1
     pose[:3, 3].square().sum().backward()
     assert torch.isfinite(gate.confidence.weight.grad).all()
+
+
+def test_frozen_native_direct_execution_preserves_child_modes_rng_and_gradients():
+    from torch.utils.checkpoint import checkpoint
+    class Aggregator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block=nn.Sequential(nn.Linear(8,8),nn.Dropout(.2),nn.GELU())
+        def forward(self,value):
+            return checkpoint(self.block,value,use_reentrant=False) if self.training else self.block(value)
+    model=PredictionModel()
+    model.native=nn.Module();model.native.aggregator=Aggregator()
+    model.native.requires_grad_(False)
+    engine=StreamingEngine(model)
+    engine.train()
+    aggregate=model.native.aggregator
+    assert not aggregate.training and aggregate.block.training and aggregate.block[1].training
+    data=torch.randn(6,8,requires_grad=True)
+    torch.manual_seed(17)
+    direct=aggregate(data);direct.square().sum().backward()
+    direct_grad=data.grad.clone();direct_rng=torch.get_rng_state()
+    aggregate.training=True
+    duplicate=data.detach().clone().requires_grad_()
+    torch.manual_seed(17)
+    recomputed=aggregate(duplicate);recomputed.square().sum().backward()
+    torch.testing.assert_close(direct,recomputed,atol=1e-6,rtol=1e-6)
+    torch.testing.assert_close(direct_grad,duplicate.grad,atol=1e-6,rtol=1e-6)
+    assert torch.equal(direct_rng,torch.get_rng_state())
+    engine.eval()
+    assert not aggregate.training and not aggregate.block.training
+
+
+def test_trainable_native_keeps_original_checkpoint_training_mode():
+    model=PredictionModel()
+    model.native=nn.Module();model.native.aggregator=nn.Sequential(nn.Linear(2,2))
+    engine=StreamingEngine(model).train()
+    assert model.native.aggregator.training
