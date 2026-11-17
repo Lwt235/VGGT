@@ -8,7 +8,7 @@ from src.vis.streaming import phase_spans, summarize_rows, v6, metric_curves
 def rows():
     return [dict(t=i,phase=('Explore' if i<3 else 'Loiter' if i<5 else 'Explore New' if i<7 else 'Revisit'),
         point_epe_m=.1*i,point_l1_m=.05*i,rotation0_deg=i,rotation1_deg=i*.9,
-        translation0_m=i*.01,translation1_m=i*.009,memory_after=min(20,i+10),active_count=min(10,i+5)) for i in range(1,9)]
+        translation0_m=i*.01,translation1_m=i*.009,memory_before=min(20,i+9),memory_after=min(20,i+10),active_count=min(10,i+5)) for i in range(1,9)]
 
 
 def test_segmented_real_frame_plan_is_explicit_and_complete():

@@ -48,14 +48,17 @@ def v6(folder, sequence, records, *, active_budget=2048, patch_tokens=192):
     fig, axes=plt.subplots(3,1,figsize=(13,10),layout='constrained',sharex=True)
     for label,rows in records.items():
         t=np.array([r['t'] for r in rows])
-        axes[0].plot(t,[r['memory_after'] for r in rows],label=label+' public total')
-        axes[1].plot(t,[r['active_count'] for r in rows],label=label+' active read')
+        with_seed=np.r_[0,t]
+        axes[0].plot(with_seed,[rows[0]['memory_before']]+[r['memory_after'] for r in rows],label=label+' public total')
+        # Seed RGB-D writes the initial map; it does not perform a memory read.
+        axes[1].plot(with_seed,[0]+[r['active_count'] for r in rows],label=label+' active read')
         axes[2].plot(t,[r['translation1_m'] for r in rows],label=label+' translation')
     base=next(iter(records.values()))
-    t=np.array([r['t'] for r in base])
+    t=np.r_[0,np.array([r['t'] for r in base])]
     axes[0].plot(t,(t+1)*patch_tokens,'--',color='#555555',label='Analytic frame KV tokens = (t+1) x patch count')
     axes[1].axhline(active_budget,ls='--',color='#555555',lw=1,label=f'Read budget {active_budget}; NOT public capacity')
-    for ax in axes:shade_phases(ax,base);ax.legend(fontsize=7,loc='upper left')
+    phase_rows=[dict(t=0,phase=base[0]['phase'])]+base
+    for ax in axes:shade_phases(ax,phase_rows);ax.legend(fontsize=7,loc='upper left')
     axes[0].set(ylabel='3DGS primitives / 2D token count',title='V6 · total public memory vs analytical frame KV growth')
     axes[1].set(ylabel='Active Gaussian primitives',title='Active-read count is separate from persistent public memory')
     axes[2].set(ylabel='Unaligned translation error [m]',xlabel='Stream step t (seed at t=0)',title='Accumulated pose error in the fixed seed-camera metric gauge')
