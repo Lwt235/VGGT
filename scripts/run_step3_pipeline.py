@@ -16,7 +16,17 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.run_step2_ablations import read_resources
+from scripts.run_step2_ablations import read_resources, Snapshot
+
+
+def resources():
+    snapshot = read_resources()
+    active = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid',
+        '--format=csv,noheader,nounits'], text=True, timeout=15)
+    # A brief utilization dip in another user's distributed training does not
+    # make that GPU idle. Require absence of existing compute contexts too.
+    occupied = frozenset(line.strip() for line in active.splitlines() if line.strip())
+    return Snapshot(snapshot.gpus, occupied)
 
 
 def available(first, second, fraction):
@@ -24,7 +34,8 @@ def available(first, second, fraction):
     def idle(g):
         cap = g.total_mib*fraction
         return g.utilization <= 15 and cap <= 20*1024 and g.free_mib >= max(12288, cap+2048)
-    return sorted([g for g in second.gpus if g.uuid in before and idle(g) and idle(before[g.uuid])],
+    occupied = first.project_variant_uuids | second.project_variant_uuids
+    return sorted([g for g in second.gpus if g.uuid in before and g.uuid not in occupied and idle(g) and idle(before[g.uuid])],
                   key=lambda g: (-g.free_mib, g.index))
 
 
@@ -50,9 +61,9 @@ def main():
             free = shutil.disk_usage(ROOT).free
             if free < 300*2**20:
                 raise RuntimeError('Step3 disk guard: less than 300 MiB free; no stage launched')
-            first = read_resources()
+            first = resources()
             time.sleep(3)
-            second = read_resources()
+            second = resources()
             candidates = available(first, second, fraction)
             if candidates:
                 gpu = candidates[0]
