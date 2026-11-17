@@ -153,7 +153,8 @@ class VGGTSpatialMemory(nn.Module):
         reference = mapping_observations[0][1].c2w if self.revision in ('v2h', 'v2i', 'v2j', 'v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5') else None
         return self.fusion(memory, reference_c2w=reference)
 
-    def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False, read_jitter=None):
+    def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False, read_jitter=None,
+                streaming=False):
         if type(query) is not QueryInput:
             raise TypeError("Query accepts only RGB/K, not supervision or camera pose")
         if read_jitter is not None and (not self.training or self.revision not in ('v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5')):
@@ -184,6 +185,10 @@ class VGGTSpatialMemory(nn.Module):
                     T0, bootstrap = self.initial_pose(tokens.float(), self.writer.latent(query_tokens),
                                                      memory, Kp, hp, wp, shallow=shallow[0].float())
                     diagnostic.update(bootstrap)
+                    if streaming:
+                        # Current-frame scratch only: consumed by the writer,
+                        # never retained in persistent streaming state.
+                        diagnostic['stream_writer_tokens'] = query_tokens
                 T0_read = T0 if read_jitter is None else T0.detach() @ read_jitter
                 read, rendered = tokens.float(), None
                 if self.render_reader is not None:
@@ -230,6 +235,11 @@ class VGGTSpatialMemory(nn.Module):
             if self.revision == 'step2_v5':
                 T1, X_T0, residual, refined = self.refine_pose(final, memory, diagnostic, T0_read)
                 diagnostic.update(refined)
+                if streaming:
+                    if not hasattr(self, 'stream_pose_gate'):
+                        raise RuntimeError('Streaming requires a StreamPoseGate')
+                    T1, pose_gate = self.stream_pose_gate(T0_read, T1, diagnostic)
+                    diagnostic['stream_pose_gate'] = pose_gate
             else:
                 T1, X_T0, residual = self.refine_pose(final, refinement_points if self.revision in ('v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5') else camera_points,
                                                     T0_read, diagnostic['rendered'], Kp, hp, wp)

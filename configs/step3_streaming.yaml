@@ -1,0 +1,32 @@
+seed: 17
+architecture_revision: step2_v5
+initialization: step2_full_18000_spatial_adaptation
+base_checkpoint: results/step2_v5_full_seed17/training_state_18000.pt
+split: configs/step2_splits.yaml
+steps: 3000
+image_hw: [168, 224]
+receive_layer: 4
+minimum_frames: 5
+maximum_frames: 8
+native_frozen: true
+camera_alignment_weight: 0.05
+anchored_camera_weight: 0.2
+anchored_relative_depth_weight: 0.2
+patch_depth_weight: 2.0
+relative_depth_weight: 0.2
+anchor_alignment_weight: 1.0
+matching_weight: 1.0
+refinement_safety_weight: 2.0
+optimizer:
+  heads_lr: 0.00005
+  pose_lr: 0.00002
+  bootstrap_lr: 0.00002
+  gate_lr: 0.0001
+  warmup_steps: 100
+  end_lr_ratio: 0.1
+  grad_clip: 5.0
+log_every: 25
+checkpoint_every: 250
+checkpoint_policy: atomic_latest_plus_final_hardlink_only
+training_gauge: seed camera c2w_0=I; later GT is criterion only
+description: Full18k warm-start, frozen native weights with differentiable input path, train-only 5–8-frame Read-then-Write unroll; no historical RGB/KV in state.
