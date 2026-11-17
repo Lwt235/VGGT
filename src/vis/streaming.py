@@ -198,6 +198,8 @@ def public_map_diagnostics(folder, sequence, reference_surfaces, map_centers, *,
             describe=lambda values:dict(mean_m=float(np.mean(values)),median_m=float(np.median(values)),p90_m=float(np.quantile(values,.9)))
             stats[label]=dict(public_gaussians=len(centers),reference_surface_samples=len(reference),reference_voxel_m=reference_voxel,
                 map_center_to_observed_surface=describe(precision),observed_surface_to_map_center=describe(coverage),
+                public_center_xyz_p10_p90_m=np.quantile(centers,[.1,.9],axis=0).tolist(),
+                reference_xyz_p10_p90_m=np.quantile(reference,[.1,.9],axis=0).tolist(),
                 definition='Unaligned Euclidean nearest-neighbour distances; center coverage proxy, not Gaussian support')
             detail=f'Map→surface {np.mean(precision):.3f} m; surface→center {np.mean(coverage):.3f} m'
         else:
