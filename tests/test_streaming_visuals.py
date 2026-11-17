@@ -1,7 +1,7 @@
 """CPU tests of actual-frame stream plans and quantitative streaming plots."""
 import numpy as np
 import pytest
-from scripts.evaluate_step3 import segmented_plan, default_plans
+from scripts.evaluate_step3 import segmented_plan, default_plans, seed_surface_overlap
 from src.vis.streaming import phase_spans, summarize_rows, v6, metric_curves
 
 
@@ -74,3 +74,13 @@ def test_training_curve_includes_actual_logged_write_confidence(tmp_path):
           for i in range(1,81)]
     training_curves(tmp_path/'new_training_directory',data)
     assert (tmp_path/'new_training_directory'/'stream_training_curves.png').stat().st_size>20000
+
+
+def test_evaluator_seed_visibility_preserves_zero_overlap_and_exact_replay():
+    from types import SimpleNamespace
+    dataset=SimpleNamespace(sequences={'room':dict(frame_ids=[31,430,797],
+        surface_overlap=[[0.,0.,.25],[0.,0.,0.],[.30,0.,0.]])})
+    plan=dict(scene='room',frame_ids=[31,430,797,31])
+    assert seed_surface_overlap(dataset,plan,430)==0.
+    assert seed_surface_overlap(dataset,plan,797)==.30
+    assert seed_surface_overlap(dataset,plan,31)==1.

@@ -18,7 +18,7 @@ import numpy as np
 VARIANTS={'Full persistent':'persistent_metrics.json','Sliding Window W=4':'sliding_window_metrics.json'}
 PHASES=('Explore','Loiter','Explore New','Revisit')
 METRICS=('point_epe_m','point_l1_m','camera_epe_m','rotation0_deg','rotation1_deg','translation0_m','translation1_m',
-         'write_confidence_mean','dustbin_mean','dustbin_rejection_rate','refinement_gate','memory_before','memory_after','active_count')
+         'write_confidence_mean','dustbin_mean','dustbin_rejection_rate','refinement_gate','memory_before','memory_after','active_count','seed_rgbd_surface_overlap')
 CSV_FIELDS=('category','stream','scene','scene_group','variant','phase','metric','count','mean','median','p90','value')
 
 
@@ -134,6 +134,10 @@ def build_report(evaluation,training_log):
                 loiter_end_public=loiter[-1]['memory_after'] if loiter else None,
                 loiter_public_change=loiter[-1]['memory_after']-loiter[0]['memory_before'] if loiter else None,
                 loiter_analytic_kv_growth=(len(loiter)*192) if loiter else None)
+            seed_overlap=metric_distribution(rows,'seed_rgbd_surface_overlap')
+            if seed_overlap is not None:
+                detail['seed_rgbd_surface_overlap']=seed_overlap
+                detail['below_one_percent_seed_surface_overlap_queries']=sum(r['seed_rgbd_surface_overlap']<.01 for r in rows)
             for phase in PHASES:
                 phase_rows=[r for r in rows if r['phase']==phase]
                 for key,value in dict(public_start=phase_rows[0]['memory_before'] if phase_rows else None,
@@ -156,6 +160,8 @@ def build_report(evaluation,training_log):
                 f"Mean write confidence distribution: {stats_text(detail['mean_write_confidence'])}; conservative pose gate: {stats_text(detail['mean_pose_gate'])}.",
                 f"Fixed GT reference-plane wall P90–P10: {fmt(detail['wall_p90_p10_m'])} m; signed median wall bias: {fmt(detail['wall_signed_bias_m'])} m."]
             if wall.get('unavailable_reason'):extras.append('Wall section unavailable: '+wall['unavailable_reason']+'.')
+            if seed_overlap is not None:
+                extras.append(f"Seed RGB-D surface visibility (mean/median/P90): {stats_text(seed_overlap)}; {detail['below_one_percent_seed_surface_overlap_queries']} queries have <1% initial-seed surface visibility. This fixed split diagnostic uses decoded-depth z agreement, not Gaussian 3-sigma support, and is never a model input.")
             if plan['scene'].startswith('harvard_c11/') and 'natural' in plan['name']:
                 extras+=['','C11 natural return frames (every occurrence, no selection):','',
                     '| Source frame | Stream t | World EPE [m] | R0 → R1 [deg] | t0 → t1 [m] | Public / active |','|---:|---:|---:|---|---|---|']

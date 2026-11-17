@@ -80,6 +80,20 @@ def prediction_metrics(output,target):
     return row
 
 
+def seed_surface_overlap(dataset, plan, frame_id):
+    """Evaluator-only RGB-D visibility from the fixed read-only split metadata.
+
+    It is not Gaussian support and never enters inference or write gating.
+    The stored pair matrix has zero diagonals by construction; an exact replay
+    of the seed is instead fully self-visible.
+    """
+    item=dataset.sequences[plan['scene']]
+    seed=plan['frame_ids'][0]
+    if frame_id==seed:return 1.
+    ids=item['frame_ids']
+    return float(item['surface_overlap'][ids.index(frame_id)][ids.index(seed)])
+
+
 def cpu_prediction(output):
     return {key:output[key].detach().float().cpu() for key in ('world_points','T0','T1')}
 
@@ -159,6 +173,7 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
             full,state=runner(query,state,return_attention=visualize and t==representative and window is None)
             row=dict(t=t,frame_id=plan['frame_ids'][t],phase=plan['phases'][t],memory_before=len(old_memory),memory_after=len(state.memory),
                 active_count=int(full.get('active_count',len(full.get('attention',{}).get('indices',[])))),**prediction_metrics(full,target))
+            row['seed_rgbd_surface_overlap']=seed_surface_overlap(dataset,plan,row['frame_id'])
             row['predicted_c2w']=full['T1'].cpu().tolist();row['target_c2w']=target.c2w.cpu().tolist()
             if not all(np.isfinite(row[k]) for k in ('point_epe_m','rotation1_deg','translation1_m')):
                 raise FloatingPointError(f'Nonfinite stream metric: {plan["name"]} t={t}')
