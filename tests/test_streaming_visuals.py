@@ -60,10 +60,14 @@ def test_wall_comparison_uses_one_fixed_gt_plane_and_keeps_ghost_layers(tmp_path
     truth=Supervision(torch.ones_like(x)*3,torch.eye(4),points,torch.ones_like(x,dtype=torch.bool))
     full=points.clone();full[...,2]+=.005*torch.sin(x*5)
     ghost=points.clone();ghost[::2,:,2]+=.20
+    translated=points.clone();translated[...,2]+=.20
     result=v1_comparison(tmp_path,'Synthetic fixture, not measured data',truth,truth,
-        {'Full persistent':{'world_points':full},'Sliding Window W=4':{'world_points':ghost}})
+        {'Full persistent':{'world_points':full},'Sliding Window W=4':{'world_points':ghost},
+         'Thin displaced layer':{'world_points':translated}})
     assert result['Full persistent']['wall_p90_p10_m']<.02
     assert result['Sliding Window W=4']['wall_p90_p10_m']>.19
+    assert result['Thin displaced layer']['wall_p90_p10_m']<1e-6
+    assert result['Thin displaced layer']['seed_query_union_p90_p10_m']>.19
     assert result['Full persistent']['reference_plane_center']==result['Sliding Window W=4']['reference_plane_center']
     assert (tmp_path/'V1_persistent_vs_sliding_window.png').stat().st_size>20000
 

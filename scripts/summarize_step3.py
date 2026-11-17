@@ -148,7 +148,7 @@ def build_report(evaluation,training_log):
                     tables.append(dict(category='phase_memory_growth',**base,variant=variant,phase=phase,metric=key,
                         count=len(phase_rows),mean=None,median=None,p90=None,value=value))
             wall=stream['variants'][variant].get('wall',{})
-            detail.update(wall_p90_p10_m=wall.get('wall_p90_p10_m'),wall_signed_bias_m=wall.get('wall_signed_bias_m'))
+            detail.update(wall_p90_p10_m=wall.get('wall_p90_p10_m'),seed_query_union_p90_p10_m=wall.get('seed_query_union_p90_p10_m'),wall_signed_bias_m=wall.get('wall_signed_bias_m'))
             for key,value in detail.items():
                 tables.append(dict(category='stream_detail',**base,variant=variant,phase='All',metric=key,
                     **(value if isinstance(value,dict) else dict(count=None,mean=None,median=None,p90=None)),value=None if isinstance(value,dict) else value))
@@ -158,7 +158,7 @@ def build_report(evaluation,training_log):
                 f"Public Gaussians final/max: {detail['final_public_gaussians']}/{detail['maximum_public_gaussians']}; maximum active read: {detail['maximum_active_gaussians']} (read budget 2048). Analytical retained-frame KV baseline at end: {detail['analytic_framewise_kv_tokens_at_end']} tokens = 192 × number of observed frames; no actual historical KV is retained.",
                 f"Loiter public count: {detail['loiter_start_public']} → {detail['loiter_end_public']} (change {detail['loiter_public_change']}); analytical KV growth during loiter: {detail['loiter_analytic_kv_growth']}. N/A loiter counts mean the natural stream has no artificial loiter phase.",
                 f"Mean write confidence distribution: {stats_text(detail['mean_write_confidence'])}; conservative pose gate: {stats_text(detail['mean_pose_gate'])}.",
-                f"Fixed GT reference-plane wall P90–P10: {fmt(detail['wall_p90_p10_m'])} m; signed median wall bias: {fmt(detail['wall_signed_bias_m'])} m."]
+                f"Fixed GT reference-plane query-only wall P90–P10: {fmt(detail['wall_p90_p10_m'])} m; balanced seed/query union P90–P10 (including displaced double layers): {fmt(detail['seed_query_union_p90_p10_m'])} m; signed median query wall bias: {fmt(detail['wall_signed_bias_m'])} m."]
             if wall.get('unavailable_reason'):extras.append('Wall section unavailable: '+wall['unavailable_reason']+'.')
             if seed_overlap is not None:
                 extras.append(f"Seed RGB-D surface visibility (mean/median/P90): {stats_text(seed_overlap)}; {detail['below_one_percent_seed_surface_overlap_queries']} queries have <1% initial-seed surface visibility. This fixed split diagnostic uses decoded-depth z agreement, not Gaussian 3-sigma support, and is never a model input.")

@@ -128,8 +128,16 @@ def v1_comparison(folder, sequence, reference, target, predictions, *, memories=
             ax.hist(signed,bins=40,density=True,color=COLD,alpha=.5,label='Seed reference')
             ax.hist(error,bins=40,density=True,color=ORANGE,alpha=.6,label='Current query prediction')
             width=float(np.ptp(np.quantile(error,[.1,.9])))
-            stats[label]={'wall_p90_p10_m':width,'wall_signed_bias_m':float(np.median(error)),'wall_pixels':int(mask.sum()),'reference_wall_p90_p10_m':thickness,'reference_plane_center':center.tolist(),'reference_plane_normal':normal.tolist()}
-            ax.set(xlabel='Signed distance to SAME fixed seed plane [m]',ylabel='Density',title=f'Wall thickness P90-P10 = {width:.3f} m');ax.legend(fontsize=7)
+            # A displaced but individually thin query wall must count as a
+            # double layer against the seed. Balance the two surface samples
+            # so unequal image coverage cannot hide either layer below P10.
+            quantiles=np.linspace(0,1,1024)
+            combined=np.r_[np.quantile(signed,quantiles),np.quantile(error,quantiles)]
+            union_width=float(np.ptp(np.quantile(combined,[.1,.9])))
+            stats[label]={'wall_p90_p10_m':width,'seed_query_union_p90_p10_m':union_width,
+                'wall_signed_bias_m':float(np.median(error)),'wall_pixels':int(mask.sum()),'reference_wall_p90_p10_m':thickness,'reference_plane_center':center.tolist(),'reference_plane_normal':normal.tolist()}
+            ax.set(xlabel='Signed distance to SAME fixed seed plane [m]',ylabel='Density',
+                title=f'P90-P10: query {width:.3f} m; balanced seed/query union {union_width:.3f} m');ax.legend(fontsize=7)
     fig.suptitle('V1 · '+sequence+' · Full vs Sliding Window; no output fitting / alignment')
     save(fig,folder/'V1_persistent_vs_sliding_window.png')
     return stats
