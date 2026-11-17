@@ -14,6 +14,8 @@ import random
 import shutil
 import sys
 import time
+import contextlib
+import itertools
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.runtime import PROJECT_ROOT, configure_local_storage, load_checkpoint_readonly, load_config
@@ -23,6 +25,7 @@ import torch
 import yaml
 from src.streaming_data import StreamingDataset
 from src.losses.world import world_loss
+from src.streaming_distributed import canonical_delta, scientific_config, trajectory_rng, trajectory_seed, TrajectorySegment
 
 
 def load_engine(config, checkpoint=None, device='cuda'):
@@ -55,13 +58,14 @@ def load_engine(config, checkpoint=None, device='cuda'):
     engine.to(device)
     if checkpoint is not None:
         state = load_checkpoint_readonly(checkpoint) if not isinstance(checkpoint, dict) else checkpoint
-        if state['config'] != config:
+        if scientific_config(state['config']) != scientific_config(config):
             raise ValueError('Step3 configuration changed at checkpoint restore')
         load_spatial_delta(engine, state['trainable'])
     return engine
 
 
 def load_spatial_delta(engine, delta):
+    delta = canonical_delta(delta)
     parameters = {name: p for name, p in engine.named_parameters() if p.requires_grad}
     if parameters.keys() != delta.keys():
         raise ValueError('Step3 trainable parameter names changed')
@@ -122,13 +126,15 @@ def require_checkpoint_space(folder, engine, *, initial=False):
         raise RuntimeError(f'Disk guard: {free/2**20:.0f} MiB free, require {required/2**20:.0f} MiB for atomic spatial checkpoint')
 
 
-def save_checkpoint(engine, optimizer, scheduler, config, folder, step):
+def save_checkpoint(engine, optimizer, scheduler, config, folder, step, rank_rng=None):
     require_checkpoint_space(folder, engine)
     checkpoint = dict(step=step, config=config,
         initialization='step2_full_18000_spatial_adaptation', base_checkpoint=config['base_checkpoint'],
         trainable={n: p.detach().cpu() for n, p in engine.named_parameters() if p.requires_grad},
         optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
-        python_rng=random.getstate(), torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all())
+        python_rng=random.getstate(), torch_rng=torch.get_rng_state(), cuda_rng=[torch.cuda.get_rng_state()], rank_rng=rank_rng,
+        distributed_runtime=dict(world_size=int(os.environ.get('WORLD_SIZE','1')),
+            trajectory_seed='seed + rank * 10007 + zero_based_step', find_unused_parameters=True))
     temporary, latest = folder/'training_state.tmp', folder/'training_state.pt'
     torch.save(checkpoint, temporary)
     temporary.replace(latest)
@@ -145,14 +151,23 @@ def module_gradient_norm(engine, prefix):
 
 
 def restore_optimizer_rng(engine, optimizer, scheduler, checkpoint, config):
-    if checkpoint['config'] != config:
+    if scientific_config(checkpoint['config']) != scientific_config(config):
         raise ValueError('Step3 resume requires identical configuration')
     load_spatial_delta(engine, checkpoint['trainable'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     scheduler.load_state_dict(checkpoint['scheduler'])
-    random.setstate(checkpoint['python_rng'])
-    torch.set_rng_state(checkpoint['torch_rng'])
-    torch.cuda.set_rng_state_all(checkpoint['cuda_rng'])
+    rank = int(os.environ.get('RANK','0'))
+    per_rank = checkpoint.get('rank_rng')
+    if per_rank and len(per_rank) == int(os.environ.get('WORLD_SIZE','1')):
+        rng = per_rank[rank]
+        random.setstate(rng['python_rng'])
+        torch.set_rng_state(rng['torch_rng'])
+        torch.cuda.set_rng_state(rng['cuda_rng'])
+    else:
+        random.setstate(checkpoint['python_rng'])
+        torch.set_rng_state(checkpoint['torch_rng'])
+        saved = checkpoint['cuda_rng']
+        torch.cuda.set_rng_state(saved[min(torch.cuda.current_device(), len(saved)-1)])
     return checkpoint['step']
 
 
@@ -206,18 +221,31 @@ def main():
         parser.error('Use run_on_available_gpu.py after live GPU/process checks')
     if not config['native_frozen']:
         parser.error('Step3 adaptation keeps native weights frozen for disk/activation budget')
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank, local_rank = int(os.environ.get('RANK', '0')), int(os.environ.get('LOCAL_RANK', '0'))
+    distributed = world_size > 1
+    if distributed and config.get('streaming_revision') != 'v2':
+        parser.error('DDP requires the detachable v2 3D streaming state')
+    torch.cuda.set_device(local_rank)
+    if distributed:
+        import torch.distributed as dist
+        from datetime import timedelta
+        dist.init_process_group('nccl', timeout=timedelta(minutes=5), device_id=torch.device(f'cuda:{local_rank}'))
     torch.set_num_threads(2)
     random.seed(config['seed']); np.random.seed(config['seed']); torch.manual_seed(config['seed']); torch.cuda.manual_seed_all(config['seed'])
-    torch.cuda.set_per_process_memory_fraction(float(os.environ['VGGT_GPU_MEMORY_FRACTION']), 0)
+    torch.cuda.set_per_process_memory_fraction(min(float(os.environ['VGGT_GPU_MEMORY_FRACTION']), 20*2**30/torch.cuda.get_device_properties(local_rank).total_memory), local_rank)
     torch.backends.cuda.matmul.allow_tf32 = True
-    folder.mkdir(exist_ok=args.resume)
+    if rank == 0:
+        folder.mkdir(exist_ok=args.resume)
+    if distributed:
+        dist.barrier(device_ids=[local_rank])
     dataset_type = StreamingDataset
     if config.get('streaming_revision') == 'v2':
         from src.streaming_data_v2 import StridedStreamingDataset
         dataset_type = StridedStreamingDataset
     dataset = dataset_type(PROJECT_ROOT/config['split'], config['image_hw'],
         config['minimum_frames'], config['maximum_frames'])
-    engine = load_engine(config).train()
+    engine = load_engine(config, device=f'cuda:{local_rank}').train()
     require_checkpoint_space(folder, engine, initial=not args.resume)
     optimizer, scheduler = build_optimizer(engine, config)
     start = 0
@@ -225,8 +253,16 @@ def main():
         checkpoint = load_checkpoint_readonly(folder/'training_state.pt')
         start = restore_optimizer_rng(engine, optimizer, scheduler, checkpoint, config)
         del checkpoint
-        reconcile_metrics_for_resume(folder, start)
-    (folder/'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
+        if rank == 0:
+            reconcile_metrics_for_resume(folder, start)
+    if rank == 0:
+        (folder/'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
+    segment_runner = None
+    if distributed:
+        from torch.nn.parallel import DistributedDataParallel
+        segment_runner = DistributedDataParallel(TrajectorySegment(engine, criterion, config),
+            device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True, broadcast_buffers=False)
+        dist.barrier(device_ids=[local_rank])
     from collections import Counter
     print('Step3 Full18k spatial adaptation; train clip starts:', dict(Counter(sid for sid,_ in dataset.training_examples)), flush=True)
     print('Trainable parameters:', sum(p.numel() for p in engine.parameters() if p.requires_grad),
@@ -237,42 +273,74 @@ def main():
     recent_gradients = []
     until = min(config['steps'], start+args.profile if args.profile else (args.until or config['steps']))
     started = time.monotonic()
-    with (folder/'metrics.jsonl').open('a' if args.resume else 'w', buffering=1) as handle:
+    log_context = (folder/'metrics.jsonl').open('a' if args.resume else 'w', buffering=1) if rank == 0 else contextlib.nullcontext(None)
+    with log_context as handle:
         for step in range(start, until):
             tic = time.monotonic()
             torch.cuda.reset_peak_memory_stats()
-            stream = dataset.sample(device='cuda')
+            if distributed:
+                # New trajectory-level batch parallelism, reproducible across
+                # resumes and independent between ranks; restored Adam/LR intact.
+                torch.manual_seed(trajectory_seed(config['seed'], rank, step))
+                torch.cuda.manual_seed(trajectory_seed(config['seed'], rank, step))
+                stream = dataset.sample(trajectory_rng(config['seed'], rank, step), device=f'cuda:{local_rank}')
+            else:
+                stream = dataset.sample(device='cuda')
             observations = iter(stream['observations'])
             seed_query, seed_truth = next(observations)
             optimizer.zero_grad(set_to_none=True)
-            state = engine.seed(seed_query, seed_truth.depth, seed_truth.valid)
-            del seed_query, seed_truth
-            losses, measurements, sizes, writes, active_counts = [], [], [], [], []
-            detached_losses = []
-            total_queries = len(stream['frame_ids'])-1
-            tbptt = config.get('tbptt_frames', total_queries)
-            for frame_index, (query, target) in enumerate(observations, 1):
-                # This is the only inference call after the seed. Ground truth
-                # remains exclusively on the following criterion line.
-                output, state = engine(query, state)
-                loss, metrics = criterion(output, target, config)
-                losses.append(loss)
-                measurements.append(metrics)
-                sizes.append(len(state.memory))
-                writes.append(output['write'])
-                active_counts.append(output['active_count'])
-                if frame_index % tbptt == 0 or frame_index == total_queries:
-                    segment = torch.stack(losses).sum()/total_queries
+            if distributed:
+                state = None
+                seed = (seed_query, seed_truth)
+                measurements, sizes, writes, active_counts = [], [], [], []
+                total_queries = len(stream['frame_ids'])-1
+                tbptt = config.get('tbptt_frames', total_queries)
+                detached_losses = []
+                # Same number of synchronized backward calls on every rank,
+                # despite independent 12--16 frame trajectories and unused gates.
+                segment_count = math.ceil((config['maximum_frames']-1)/tbptt)
+                for segment_index in range(segment_count):
+                    frames = list(itertools.islice(observations, tbptt))
+                    segment, state, info = segment_runner(frames, state, seed, total_queries)
+                    seed = None
                     if not torch.isfinite(segment):
-                        raise RuntimeError('Nonfinite streaming training loss')
+                        raise RuntimeError('Nonfinite distributed streaming loss')
                     segment.backward()
-                    detached_losses.extend(x.detach() for x in losses)
-                    losses.clear()
-                    if config.get('streaming_revision') == 'v2':
-                        from src.streaming_v2 import detach_state
-                        state = detach_state(state)
-                    del segment
-            loss = torch.stack(detached_losses).mean()
+                    detached_losses.append(segment.detach())
+                    for destination, values in zip((measurements,sizes,writes,active_counts), info):
+                        destination.extend(values)
+                    del frames, segment, info
+                loss = torch.stack(detached_losses).sum()
+                del seed_query, seed_truth
+            else:
+                state = engine.seed(seed_query, seed_truth.depth, seed_truth.valid)
+                del seed_query, seed_truth
+                losses, measurements, sizes, writes, active_counts = [], [], [], [], []
+                detached_losses = []
+                total_queries = len(stream['frame_ids'])-1
+                tbptt = config.get('tbptt_frames', total_queries)
+                for frame_index, (query, target) in enumerate(observations, 1):
+                    # This is the only inference call after the seed. Ground truth
+                    # remains exclusively on the following criterion line.
+                    output, state = engine(query, state)
+                    loss, metrics = criterion(output, target, config)
+                    losses.append(loss)
+                    measurements.append(metrics)
+                    sizes.append(len(state.memory))
+                    writes.append(output['write'])
+                    active_counts.append(output['active_count'])
+                    if frame_index % tbptt == 0 or frame_index == total_queries:
+                        segment = torch.stack(losses).sum()/total_queries
+                        if not torch.isfinite(segment):
+                            raise RuntimeError('Nonfinite streaming training loss')
+                        segment.backward()
+                        detached_losses.extend(x.detach() for x in losses)
+                        losses.clear()
+                        if config.get('streaming_revision') == 'v2':
+                            from src.streaming_v2 import detach_state
+                            state = detach_state(state)
+                        del segment
+                loss = torch.stack(detached_losses).mean()
             norms = {name:module_gradient_norm(engine, prefix) for name,prefix in prefixes.items()}
             if not all(math.isfinite(value) for value in norms.values()):
                 bad = [n for n,p in engine.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
@@ -297,21 +365,45 @@ def main():
                 peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
                 peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,
                 step_seconds=time.monotonic()-tic)
-            handle.write(json.dumps(record, allow_nan=False)+'\n')
+            if distributed:
+                local_summary = {key:record[key] for key in ('scene','mode','frame_ids','frames','source_indices','strides','seed_surface_overlap',
+                    'loss',*keys,'peak_allocated_gib','peak_reserved_gib')}
+                gathered = [None]*world_size
+                dist.all_gather_object(gathered, local_summary)
+                record['rank_trajectories'] = gathered
+                record['distributed_world_size'] = world_size
+                for key in ('loss', *keys):
+                    record[key] = float(np.mean([row[key] for row in gathered]))
+                for key in ('peak_allocated_gib','peak_reserved_gib'):
+                    record[key] = max(row[key] for row in gathered)
+            if handle is not None:
+                handle.write(json.dumps(record, allow_nan=False)+'\n')
             recent_gradients.append(norms); recent_gradients = recent_gradients[-50:]
-            if step < 3 or (step+1) % config['log_every'] == 0 or args.profile:
+            if rank == 0 and (step < 3 or (step+1) % config['log_every'] == 0 or args.profile):
                 print(json.dumps(record), flush=True)
-            del state, output, loss, losses, measurements, observations, stream, query, target
+            del state, loss, measurements, observations, stream
             if not args.profile and ((step+1) % config['checkpoint_every'] == 0 or step+1 == until):
-                save_checkpoint(engine, optimizer, scheduler, config, folder, step+1)
+                rank_rng = None
+                if distributed:
+                    rank_rng = [None]*world_size
+                    dist.all_gather_object(rank_rng, dict(python_rng=random.getstate(), torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state()))
+                if rank == 0:
+                    save_checkpoint(engine, optimizer, scheduler, config, folder, step+1, rank_rng=rank_rng)
+                if distributed:
+                    dist.barrier(device_ids=[local_rank])
             if len(recent_gradients) == 50 and (step+1) % 100 == 0:
                 for name in ('writer', 'o5', 'o6', 'write_gate'):
                     if not any(row[name] > 0 for row in recent_gradients):
                         raise RuntimeError('Persistent disconnected streaming module: '+name)
     summary = dict(completed_steps=until, profile=bool(args.profile), elapsed_minutes=round((time.monotonic()-started)/60, 1),
         train_only=True, no_post_alignment=True, checkpoint_policy=config['checkpoint_policy'])
-    (folder/'summary.json').write_text(json.dumps(summary, indent=2))
-    print(json.dumps(summary), flush=True)
+    summary['distributed_world_size'] = world_size
+    if rank == 0:
+        (folder/'summary.json').write_text(json.dumps(summary, indent=2))
+        print(json.dumps(summary), flush=True)
+    if distributed:
+        dist.barrier(device_ids=[local_rank])
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

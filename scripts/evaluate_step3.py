@@ -245,13 +245,14 @@ def main():
     parser.add_argument('--plan-only',action='store_true')
     parser.add_argument('--no-visualize',action='store_true')
     parser.add_argument('--streams',nargs='*',help='Exact plan names; default is all five streams')
+    parser.add_argument('--worker',action='store_true',help='Own plan directories only; coordinator merges root metadata')
     args=parser.parse_args()
     output=PROJECT_ROOT/args.output;output.mkdir(parents=True,exist_ok=True)
     spec=yaml.safe_load((PROJECT_ROOT/args.split).read_text())
     plans=json.loads((PROJECT_ROOT/args.plans).read_text()) if args.plans else default_plans(spec)
     if args.streams:plans=[p for p in plans if p['name'] in args.streams]
     if not plans:raise ValueError('No selected stream plans')
-    dump_json(output/'stream_plans.json',plans)
+    if not args.worker:dump_json(output/'stream_plans.json',plans)
     if args.plan_only:
         print(json.dumps([{k:p[k] for k in ('name','scene','kind')}|{'steps':len(p['frame_ids'])} for p in plans],indent=2));return
     if not torch.cuda.is_available():raise RuntimeError('CUDA required; resource checks must be performed by the launcher')
@@ -269,14 +270,15 @@ def main():
     for plan in plans:
         folder=output/plan['name'];folder.mkdir(exist_ok=True)
         comparisons.append(evaluate_plan(engine,dataset,plan,folder,visualize=not args.no_visualize))
-        dump_json(output/'summary.json',dict(checkpoint=args.checkpoint,world_gauge='seed I, metric m; no posterior alignment',
-            seed_inputs='RGB/K + seed-only RGB-D; later RGB/K only',streams=comparisons))
+        if not args.worker:
+            dump_json(output/'summary.json',dict(checkpoint=args.checkpoint,world_gauge='seed I, metric m; no posterior alignment',
+                seed_inputs='RGB/K + seed-only RGB-D; later RGB/K only',streams=comparisons))
     training_log=(PROJECT_ROOT/args.checkpoint).parent/'metrics.jsonl'
-    if training_log.exists():
+    if training_log.exists() and not args.worker:
         rows=[json.loads(line) for line in training_log.read_text().splitlines() if line.strip()]
         training_curves(output/'vis',rows)
     manifest=sorted(str(p.relative_to(output)) for p in output.rglob('*.png'))
-    dump_json(output/'image_manifest.json',{'images':manifest,'opened_by_agent':False})
+    if not args.worker:dump_json(output/'image_manifest.json',{'images':manifest,'opened_by_agent':False})
     print('Streaming evaluation completed:',output,flush=True)
 
 
