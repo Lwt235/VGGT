@@ -134,12 +134,13 @@ def v1_comparison(folder, sequence, reference, target, predictions, *, memories=
 
 def training_curves(folder, rows):
     if not rows:return
+    folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
     fig,axes=plt.subplots(1,3,figsize=(13,4),layout='constrained')
-    for ax,key in zip(axes,('loss','point_epe_m','write_confidence_mean')):
+    for ax,key in zip(axes,('loss','point_epe_m','mean_write_confidence')):
         values=[r for r in rows if key in r]
         ax.plot([r['step'] for r in values],[r[key] for r in values],alpha=.3)
         if len(values)>=40:
             ax.plot([r['step'] for r in values][39:],np.convolve([r[key] for r in values],np.ones(40)/40,'valid'))
         ax.set(title=key,xlabel='Streaming optimizer updates')
     fig.suptitle('Step 3 · train scenes only, heldout frames excluded')
-    save(fig,Path(folder)/'stream_training_curves.png')
+    save(fig,folder/'stream_training_curves.png')

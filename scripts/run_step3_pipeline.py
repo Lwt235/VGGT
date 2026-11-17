@@ -29,13 +29,13 @@ def resources():
     return Snapshot(snapshot.gpus, occupied)
 
 
-def available(first, second, fraction):
+def available(first, second, fraction, *, allow_shared=False):
     before = {g.uuid: g for g in first.gpus}
     def idle(g):
         cap = g.total_mib*fraction
-        return g.utilization <= 15 and cap <= 20*1024 and g.free_mib >= max(12288, cap+2048)
+        return (allow_shared or g.utilization <= 15) and cap <= 20*1024 and g.free_mib >= max(12288, cap+2048)
     occupied = first.project_variant_uuids | second.project_variant_uuids
-    return sorted([g for g in second.gpus if g.uuid in before and g.uuid not in occupied and idle(g) and idle(before[g.uuid])],
+    return sorted([g for g in second.gpus if g.uuid in before and (allow_shared or g.uuid not in occupied) and idle(g) and idle(before[g.uuid])],
                   key=lambda g: (-g.free_mib, g.index))
 
 
@@ -46,6 +46,8 @@ def main():
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--skip-profile', action='store_true')
     parser.add_argument('--tests-only', action='store_true')
+    parser.add_argument('--allow-shared', action='store_true',
+        help='Explicitly authorized serial sharing: require memory cap plus reserve, allow existing compute contexts')
     args = parser.parse_args()
     folder = ROOT/'results/step3_protocol'
     folder.mkdir(exist_ok=True)
@@ -64,11 +66,11 @@ def main():
             first = resources()
             time.sleep(3)
             second = resources()
-            candidates = available(first, second, fraction)
+            candidates = available(first, second, fraction, allow_shared=args.allow_shared)
             if candidates:
                 gpu = candidates[0]
                 # run_on_available_gpu performs its own live memory/process check.
-                report(f'Launch {stage}: GPU {gpu.index}, free {gpu.free_mib} MiB, cap {fraction}, disk {free//2**20} MiB')
+                report(f'Launch {stage}: GPU {gpu.index}, free {gpu.free_mib} MiB, cap {fraction}, disk {free//2**20} MiB, authorized_shared={args.allow_shared}')
                 command = [sys.executable, '-B', 'scripts/run_on_available_gpu.py', '--gpu', str(gpu.index),
                     '--min-free-mib', '12288', '--memory-fraction', str(fraction), '--', sys.executable, '-B', *arguments]
                 import os

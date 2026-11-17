@@ -21,3 +21,11 @@ def test_scheduler_preserves_memory_reserve_and_absolute_twenty_gib_cap():
     assert available(empty, snapshot(free=19000), .38) == []
     huge = snapshot(total=96*1024, free=90*1024)
     assert available(huge, huge, .38) == []
+
+
+def test_explicit_shared_authorization_allows_serial_busy_gpu_with_memory_only():
+    busy = snapshot(busy=True, utilization=100, free=40000)
+    assert available(busy, busy, .38) == []
+    assert len(available(busy, busy, .38, allow_shared=True)) == 1
+    insufficient = snapshot(busy=True, utilization=100, free=19000)
+    assert available(insufficient, insufficient, .38, allow_shared=True) == []

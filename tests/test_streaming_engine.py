@@ -117,3 +117,17 @@ def test_conservative_pose_gate_no_support_identity_and_world_equivariance():
     torch.testing.assert_close(shifted, G@result, atol=2e-6, rtol=2e-6)
     (result[:3, 3].square().sum()).backward()
     assert gate.confidence.bias.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA mixed-device gate test')
+def test_stream_gate_accepts_cpu_double_lm_diagnostic_on_cuda():
+    gate = StreamPoseGate().cuda()
+    base = torch.eye(4, device='cuda')
+    proposed = base.clone(); proposed[0, 3] = .04
+    diagnostic = dict(dustbin_probability=torch.zeros(6, device='cuda'),
+        matching_attention=torch.tensor([[1., 0.]], device='cuda').expand(6, -1),
+        refinement_lm_energy_history=torch.tensor([3., 2., 1.], dtype=torch.float64, device='cpu'))
+    pose, gain = gate(base, proposed, diagnostic)
+    assert pose.is_cuda and gain.is_cuda and 0 < gain < 1
+    pose[:3, 3].square().sum().backward()
+    assert torch.isfinite(gate.confidence.weight.grad).all()

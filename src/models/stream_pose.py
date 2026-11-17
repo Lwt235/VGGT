@@ -27,6 +27,9 @@ class StreamPoseGate(nn.Module):
         history = diagnostic.get('refinement_lm_energy_history')
         improvement = quality*0 if history is None else (
             (history[0]-history[-1])/history[0].abs().clamp_min(1e-6)).clamp(0, 1)
+        # Small LM systems deliberately run in CPU float64; diagnostics must
+        # join the GPU feature tensor explicitly (no change to pose solving).
+        improvement = improvement.to(quality)
         distance = delta[:3, 3].norm()
         trace = delta[:3, :3].diagonal().sum()
         # Rotation trace is used only for magnitude limiting, not pose loss.

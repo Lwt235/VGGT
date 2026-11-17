@@ -19,7 +19,7 @@ import yaml
 from src.data import Supervision
 from src.geometry import invert_se3, transform_points, intrinsics_cv_to_edge
 from src.losses.world import pose_errors
-from src.vis.streaming import v6, metric_curves, summarize_rows, v1_comparison
+from src.vis.streaming import v6, metric_curves, summarize_rows, v1_comparison, training_curves
 from src.vis.step2 import dump_json
 
 C11='harvard_c11/hv_c11_2'
@@ -232,6 +232,10 @@ def main():
         comparisons.append(evaluate_plan(engine,dataset,plan,folder,visualize=not args.no_visualize))
         dump_json(output/'summary.json',dict(checkpoint=args.checkpoint,world_gauge='seed I, metric m; no posterior alignment',
             seed_inputs='RGB/K + seed-only RGB-D; later RGB/K only',streams=comparisons))
+    training_log=(PROJECT_ROOT/args.checkpoint).parent/'metrics.jsonl'
+    if training_log.exists():
+        rows=[json.loads(line) for line in training_log.read_text().splitlines() if line.strip()]
+        training_curves(output/'vis',rows)
     manifest=sorted(str(p.relative_to(output)) for p in output.rglob('*.png'))
     dump_json(output/'image_manifest.json',{'images':manifest,'opened_by_agent':False})
     print('Streaming evaluation completed:',output,flush=True)
