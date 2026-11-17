@@ -112,7 +112,8 @@ def build_report(evaluation,training_log):
             data=read_json(folder/filename)
             if data['plan']!=plan:raise ValueError('Per-stream metrics have a different plan')
             rows=data['rows'];validate_rows(rows,plan,variant);all_rows[variant]=rows
-            for phase in ('All',*PHASES):
+            extra_phases=[p for p in dict.fromkeys(r['phase'] for r in rows) if p not in PHASES]
+            for phase in ('All',*PHASES,*extra_phases):
                 selected=rows if phase=='All' else [r for r in rows if r['phase']==phase]
                 stats={key:metric_distribution(selected,key) if selected else None for key in METRICS}
                 for key,value in stats.items():

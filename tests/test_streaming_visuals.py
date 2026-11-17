@@ -28,6 +28,7 @@ def test_natural_streams_never_drop_difficult_or_blind_frames():
     plans=default_plans(spec)
     assert plans[0]['frame_ids']==list(range(52))
     assert plans[1]['frame_ids']==list(range(17))
+    assert plans[1]['phases']==['Natural']*17
     assert 'Loiter' not in plans[0]['phases']
     assert len(plans)==5
     # C11's natural return must not be relabelled as new outward exploration.

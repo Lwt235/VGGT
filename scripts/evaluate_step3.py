@@ -58,7 +58,8 @@ def default_plans(spec, *, steps=80):
         ids=items[sid]['frame_ids'];n=len(ids)
         # Natural streams have no fabricated loiter phase; temporal segments
         # are declared by source index, never selected using predictions/GT.
-        phases=['Explore' if i<n//3 else 'Explore New' if i<5*n//6 else 'Revisit' for i in range(n)]
+        phases=(['Explore' if i<n//3 else 'Explore New' if i<5*n//6 else 'Revisit' for i in range(n)]
+                if sid==C11 else ['Natural']*n)
         plans.append(dict(name=sid.replace('/','__')+'__natural',scene=sid,frame_ids=ids,phases=phases,
             kind='natural complete paired-frame order',source_indices=list(range(n))))
     for prefix in ('harvard_c11/','harvard_c5/','harvard_c8/'):
