@@ -26,7 +26,7 @@ C11='harvard_c11/hv_c11_2'
 ROBOTICS='harvard_robotics_lab/hv_s1_1'
 
 
-def segmented_plan(frame_ids, *, steps=80):
+def segmented_plan(frame_ids, *, steps=80, outward_end=None):
     """Four explicitly labelled phases of an actual-frame replay, no GT use.
 
     Forward explore -> small local bounce -> outward to end -> backward to
@@ -36,17 +36,19 @@ def segmented_plan(frame_ids, *, steps=80):
     if len(frame_ids)<8:raise ValueError('Need at least eight real paired frames')
     if not 60<=steps<=100:raise ValueError('Long-stream replay must have 60–100 steps')
     n=len(frame_ids);cut=max(3,n//3)
+    end=n-1 if outward_end is None else int(outward_end)
+    if not cut<=end<n:raise ValueError('Outward endpoint must follow the initial explored segment')
     lengths=[steps//4]*3+[steps-3*(steps//4)]
     explore=np.linspace(0,cut-1,lengths[0]).round().astype(int).tolist()
     bounce=list(range(cut-1,max(0,cut-5),-1))+list(range(max(0,cut-5),cut-1))
     loiter=[bounce[i%len(bounce)] for i in range(lengths[1])]
-    new=np.linspace(loiter[-1],n-1,lengths[2]).round().astype(int).tolist()
-    revisit=np.linspace(n-1,0,lengths[3]).round().astype(int).tolist()
+    new=np.linspace(loiter[-1],end,lengths[2]).round().astype(int).tolist()
+    revisit=np.linspace(end,0,lengths[3]).round().astype(int).tolist()
     indices=explore+loiter+new+revisit
     labels=sum(([label]*count for label,count in zip(('Explore','Loiter','Explore New','Revisit'),lengths)),[])
     return {'frame_ids':[int(frame_ids[i]) for i in indices],'phases':labels,
             'kind':'constructed real-frame outward/bounce/backward replay; not natural recording order',
-            'source_indices':indices}
+            'source_indices':indices,'outward_end_source_index':end}
 
 
 def default_plans(spec, *, steps=80):
@@ -61,7 +63,13 @@ def default_plans(spec, *, steps=80):
             kind='natural complete paired-frame order',source_indices=list(range(n))))
     for prefix in ('harvard_c11/','harvard_c5/','harvard_c8/'):
         sid=next(k for k in items if k.startswith(prefix))
-        plans.append(dict(name=sid.replace('/','__')+'__segmented',scene=sid,**segmented_plan(items[sid]['frame_ids'],steps=steps)))
+        ids=items[sid]['frame_ids']
+        # C11 already contains a natural return in its final sixth. Its
+        # constructed outward leg stops BEFORE that return, then replays the
+        # outward route backwards. All 52 frames still occur in natural above.
+        endpoint=5*len(ids)//6-1 if prefix=='harvard_c11/' else None
+        plans.append(dict(name=sid.replace('/','__')+'__segmented',scene=sid,
+            **segmented_plan(ids,steps=steps,outward_end=endpoint)))
     return plans
 
 

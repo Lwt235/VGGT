@@ -30,6 +30,11 @@ def test_natural_streams_never_drop_difficult_or_blind_frames():
     assert plans[1]['frame_ids']==list(range(17))
     assert 'Loiter' not in plans[0]['phases']
     assert len(plans)==5
+    # C11's natural return must not be relabelled as new outward exploration.
+    c11=plans[2]
+    assert c11['outward_end_source_index']==42
+    assert max(c11['source_indices'])==42
+    assert c11['source_indices'][59]==c11['source_indices'][60]==42
 
 
 def test_phase_intervals_and_summary_keep_tail_errors():
