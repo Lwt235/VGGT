@@ -47,7 +47,11 @@ def load_engine(config, checkpoint=None, device='cuda'):
     # StreamingMomentFusion is a separate stateful moment update module; the
     # offline mapping fusion is only its immutable Full18k initialization.
     model.fusion.requires_grad_(False)
-    engine = StreamingEngine(model)
+    if config.get('streaming_revision') == 'v2':
+        from src.streaming_v2 import StreamingEngineV2
+        engine = StreamingEngineV2(model)
+    else:
+        engine = StreamingEngine(model)
     engine.to(device)
     if checkpoint is not None:
         state = load_checkpoint_readonly(checkpoint) if not isinstance(checkpoint, dict) else checkpoint
@@ -207,7 +211,11 @@ def main():
     torch.cuda.set_per_process_memory_fraction(float(os.environ['VGGT_GPU_MEMORY_FRACTION']), 0)
     torch.backends.cuda.matmul.allow_tf32 = True
     folder.mkdir(exist_ok=args.resume)
-    dataset = StreamingDataset(PROJECT_ROOT/config['split'], config['image_hw'],
+    dataset_type = StreamingDataset
+    if config.get('streaming_revision') == 'v2':
+        from src.streaming_data_v2 import StridedStreamingDataset
+        dataset_type = StridedStreamingDataset
+    dataset = dataset_type(PROJECT_ROOT/config['split'], config['image_hw'],
         config['minimum_frames'], config['maximum_frames'])
     engine = load_engine(config).train()
     require_checkpoint_space(folder, engine, initial=not args.resume)
@@ -219,7 +227,8 @@ def main():
         del checkpoint
         reconcile_metrics_for_resume(folder, start)
     (folder/'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
-    print('Step3 Full18k spatial adaptation; train clips:', {sid:len(w) for sid,w in dataset.training_windows.items()}, flush=True)
+    from collections import Counter
+    print('Step3 Full18k spatial adaptation; train clip starts:', dict(Counter(sid for sid,_ in dataset.training_examples)), flush=True)
     print('Trainable parameters:', sum(p.numel() for p in engine.parameters() if p.requires_grad),
           'estimated checkpoint MiB:', round(checkpoint_bytes(engine)/2**20), flush=True)
     prefixes = dict(writer='model.writer', o5='model.render_reader', o6='model.pe_reader',
@@ -239,7 +248,10 @@ def main():
             state = engine.seed(seed_query, seed_truth.depth, seed_truth.valid)
             del seed_query, seed_truth
             losses, measurements, sizes, writes, active_counts = [], [], [], [], []
-            for query, target in observations:
+            detached_losses = []
+            total_queries = len(stream['frame_ids'])-1
+            tbptt = config.get('tbptt_frames', total_queries)
+            for frame_index, (query, target) in enumerate(observations, 1):
                 # This is the only inference call after the seed. Ground truth
                 # remains exclusively on the following criterion line.
                 output, state = engine(query, state)
@@ -249,10 +261,18 @@ def main():
                 sizes.append(len(state.memory))
                 writes.append(output['write'])
                 active_counts.append(output['active_count'])
-            loss = torch.stack(losses).mean()
-            if not torch.isfinite(loss):
-                raise RuntimeError('Nonfinite streaming training loss')
-            loss.backward()
+                if frame_index % tbptt == 0 or frame_index == total_queries:
+                    segment = torch.stack(losses).sum()/total_queries
+                    if not torch.isfinite(segment):
+                        raise RuntimeError('Nonfinite streaming training loss')
+                    segment.backward()
+                    detached_losses.extend(x.detach() for x in losses)
+                    losses.clear()
+                    if config.get('streaming_revision') == 'v2':
+                        from src.streaming_v2 import detach_state
+                        state = detach_state(state)
+                    del segment
+            loss = torch.stack(detached_losses).mean()
             norms = {name:module_gradient_norm(engine, prefix) for name,prefix in prefixes.items()}
             if not all(math.isfinite(value) for value in norms.values()):
                 bad = [n for n,p in engine.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
@@ -264,12 +284,15 @@ def main():
                     'dustbin_mean','surface_support_rate','anchored_camera_epe_m')
             record = dict(step=step+1, scene=stream['scene'], mode=stream['mode'], frame_ids=stream['frame_ids'],
                 frames=len(stream['frame_ids']), loss=float(loss.detach()),
+                tbptt_frames=tbptt, source_indices=stream.get('source_indices'),
+                strides=stream.get('strides'), seed_surface_overlap=stream.get('seed_surface_overlap'),
                 **{key:float(np.mean([r[key] for r in measurements])) for key in keys},
                 public_gaussians=sizes[-1], public_gaussians_per_frame=sizes, module_grad_norms=norms,
                 active_gaussians_per_frame=active_counts,
                 mean_write_confidence=float(np.mean([r['mean_confidence'] for r in writes])),
                 mean_frame_write_quality=float(np.mean([r['frame_quality'] for r in writes])),
                 mean_written_candidates=float(np.mean([r['candidates'] for r in writes])),
+                write_checks=writes if config.get('streaming_revision') == 'v2' else None,
                 mean_observation_support=float(state.support.detach().mean()) if len(state.support) else 0.,
                 peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
                 peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,

@@ -129,21 +129,23 @@ def display_shells(folder,scene,memory,max_shells=256):
 
 
 @torch.no_grad()
-def read_only(engine,query,memory,*,return_attention=False):
+def read_only(engine,query,memory,*,return_attention=False,support=None):
     if hasattr(engine,'read'):
+        if support is not None:
+            return engine.read(query,memory,return_attention=return_attention,support=support)
         return engine.read(query,memory,return_attention=return_attention)
     return engine.model(query,memory,return_attention=return_attention,streaming=True)
 
 
 @torch.no_grad()
-def representative_figures(engine,dataset,plan,t,query,target,memory,full,folder):
+def representative_figures(engine,dataset,plan,t,query,target,memory,full,folder,*,support=None):
     """Interventions are read-only branches, never committed into the stream."""
     from scripts.train_step2 import intervention_box,erasure_metrics
     from src.vis.smoke import v1,v3,v4,v5
     folder.mkdir(parents=True,exist_ok=True)
-    empty=read_only(engine,query,memory.subset(slice(0,0)))
+    empty=read_only(engine,query,memory.subset(slice(0,0)),support=None if support is None else support[:0])
     box=intervention_box(memory,target);partial,mask=memory.erase_box(*box)
-    erased=read_only(engine,query,partial)
+    erased=read_only(engine,query,partial,support=None if support is None else support[~mask])
     # Reload only one seed for this offline figure. No engine ever stores it.
     seed=next(iter(dataset.load_stream(plan['scene'],[plan['frame_ids'][0]],device=query.rgb.device)['observations']))
     scene=dict(name=plan['name']+f' / t={t}; pre-write map',mapping=[seed])
@@ -169,23 +171,31 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
     from src.streaming import StreamingEngine
     records={};snapshots={};map_snapshots={};final_centers={};gt_surfaces=[];seed_reference=None
     for label,window in (('Full persistent',None),('Sliding Window W=4',4)):
-        runner=StreamingEngine(engine.model,window=window).to(next(engine.parameters()).device).eval()
+        runner=type(engine)(engine.model,window=window).to(next(engine.parameters()).device).eval()
         # Share the trained stream-specific gates/fusion too, not only VGGT.
         runner.load_state_dict(engine.state_dict(),strict=True)
         observations=iter(dataset.load_stream(plan['scene'],plan['frame_ids'],device=next(engine.parameters()).device)['observations'])
         q0,t0=next(observations);state=runner.seed(q0,t0.depth,t0.valid)
+        seed_geometry=state.memory.means.detach().clone() if hasattr(state,'seed_lock') else None
         if window is None:gt_surfaces.append(t0.world_points[t0.valid][::4].detach().float().cpu().numpy())
         seed_reference=cpu_target(t0);del q0,t0
         rows=[]
         representative=len(plan['frame_ids'])-1
         for t,(query,target) in enumerate(observations,1):
             old_memory=state.memory
+            old_support=state.support if hasattr(state,'seed_lock') else None
             full,state=runner(query,state,return_attention=visualize and t==representative and window is None)
             if window is None:gt_surfaces.append(target.world_points[target.valid][::4].detach().float().cpu().numpy())
             row=dict(t=t,frame_id=plan['frame_ids'][t],phase=plan['phases'][t],memory_before=len(old_memory),memory_after=len(state.memory),
                 active_count=int(full.get('active_count',len(full.get('attention',{}).get('indices',[])))),**prediction_metrics(full,target))
             row['seed_rgbd_surface_overlap']=seed_surface_overlap(dataset,plan,row['frame_id'])
             row['predicted_c2w']=full['T1'].cpu().tolist();row['target_c2w']=target.c2w.cpu().tolist()
+            if old_support is not None:
+                row['write_checks']=full['write']
+                row['mean_support']=float(state.support.mean()) if len(state.support) else 0.
+                row['seed_locked_gaussians']=int(state.seed_lock.sum())
+                row['seed_geometry_drift_max_m']=(float((state.memory.means[state.seed_lock]-seed_geometry).norm(dim=-1).max())
+                    if state.seed_lock.any() else None)
             if not all(np.isfinite(row[k]) for k in ('point_epe_m','rotation1_deg','translation1_m')):
                 raise FloatingPointError(f'Nonfinite stream metric: {plan["name"]} t={t}')
             rows.append(row)
@@ -195,7 +205,7 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
                 map_snapshots[label]=GaussianMemory(*(value.detach().float().cpu() for value in
                     (old_memory.means,old_memory.covars,old_memory.alpha,old_memory.features)))
                 if visualize and window is None:
-                    causal=representative_figures(runner,dataset,plan,t,query,target,old_memory,full,folder/'vis'/'full')
+                    causal=representative_figures(runner,dataset,plan,t,query,target,old_memory,full,folder/'vis'/'full',support=old_support)
                     dump_json(folder/'representative_interventions.json',causal)
                 last_target=cpu_target(target)
             if t%10==0:print(plan['name'],label,t,'/',len(plan['frame_ids'])-1,'memory',len(state.memory),'EPE',round(row['point_epe_m'],3),flush=True)

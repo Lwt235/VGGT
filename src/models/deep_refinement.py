@@ -31,6 +31,8 @@ class DeepEllipsoidRefinement(nn.Module):
         query = F.normalize(bootstrap['matching_query']+self.query_delta(final), dim=-1)
         logits = query @ bootstrap['matching_keys'].T*bootstrap['matching_temperature']
         logits = logits+memory.alpha.clamp_min(1e-6).log()[None]
+        if bootstrap.get('matching_mask') is not None:
+            logits = logits.masked_fill(~bootstrap['matching_mask'][None], -80.)
         dustbin = bootstrap['matching_dustbin_logit']+self.dustbin_delta(final)
         W = torch.cat((logits, dustbin), -1).softmax(-1)
         p_match = 1-W[:, -1]

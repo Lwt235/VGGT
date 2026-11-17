@@ -43,13 +43,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--poll-seconds', type=int, default=30)
     parser.add_argument('--run', default='step3_streaming_seed17')
+    parser.add_argument('--config', default='configs/step3_streaming.yaml')
+    parser.add_argument('--protocol', default='step3_protocol')
+    parser.add_argument('--skip-tests-before', action='store_true')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--skip-profile', action='store_true')
     parser.add_argument('--tests-only', action='store_true')
     parser.add_argument('--allow-shared', action='store_true',
         help='Explicitly authorized serial sharing: require memory cap plus reserve, allow existing compute contexts')
     args = parser.parse_args()
-    folder = ROOT/'results/step3_protocol'
+    import yaml
+    config = yaml.safe_load((ROOT/args.config).read_text())
+    v2 = config.get('streaming_revision') == 'v2'
+    if v2 and (args.run == 'step3_streaming_seed17' or args.protocol == 'step3_protocol'):
+        parser.error('v2 requires separate run and protocol directories')
+    folder = ROOT/'results'/args.protocol
     folder.mkdir(exist_ok=True)
     lock = (folder/'pipeline.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -58,7 +66,8 @@ def main():
         line = datetime.now(timezone.utc).isoformat(timespec='seconds')+' '+message
         print(line, flush=True); log.write(line+'\n')
 
-    def run(stage, arguments, *, fraction=.38, require_gsplat=False):
+    def run(stage, arguments, *, fraction=None, require_gsplat=False):
+        fraction = (.28 if v2 else .38) if fraction is None else fraction
         while True:
             free = shutil.disk_usage(ROOT).free
             if free < 300*2**20:
@@ -86,26 +95,37 @@ def main():
             report('Waiting: no repeatedly idle GPU; utilizations '+','.join(f'{g.index}:{g.utilization:g}%' for g in second.gpus))
             time.sleep(max(1, min(args.poll_seconds, 60)))
 
-    run('strict_tests_before', ['-m', 'pytest', '-q'], fraction=.16, require_gsplat=True)
+    if not args.skip_tests_before:
+        run('strict_tests_before', ['-m', 'pytest', '-q'], fraction=.16, require_gsplat=True)
+    elif not (folder/'strict_tests_before.log').exists() or 'passed' not in (folder/'strict_tests_before.log').read_text():
+        raise ValueError('No completed strict test log in this protocol directory')
     if args.tests_only:
         return
     if not args.skip_profile:
         profile_run = args.run.replace('seed17', 'profile_seed17')
         if (ROOT/'results'/profile_run).exists():
             profile_run += '_'+datetime.now(timezone.utc).strftime('%m%d%H%M%S')
-        run('unroll_profile', ['scripts/train_step3.py', '--run', profile_run, '--profile', '3'])
+        run('unroll_profile', ['scripts/train_step3.py', '--config', args.config, '--run', profile_run, '--profile', '3'])
         profile = json.loads((ROOT/'results'/profile_run/'summary.json').read_text())
         if not profile.get('profile') or profile['completed_steps'] != 3:
             raise RuntimeError('Streaming profile did not complete all three real unroll updates')
-    training = ['scripts/train_step3.py', '--run', args.run]
+        if v2:
+            rows = [json.loads(x) for x in (ROOT/'results'/profile_run/'metrics.jsonl').read_text().splitlines()]
+            if max(r['peak_allocated_gib'] for r in rows) > 15:
+                raise RuntimeError('Long TBPTT profile exceeded 15 GiB')
+    training = ['scripts/train_step3.py', '--config', args.config, '--run', args.run]
     if args.resume:
         training.append('--resume')
     run('stream_training', training)
     summary = json.loads((ROOT/'results'/args.run/'summary.json').read_text())
-    if summary['completed_steps'] != 3000 or summary.get('profile'):
+    if summary['completed_steps'] != config['steps'] or summary.get('profile'):
         raise RuntimeError('Step3 training is incomplete; evaluation not launched')
-    run('stream_evaluation', ['scripts/evaluate_step3.py', '--checkpoint', f'results/{args.run}/training_state.pt',
-        '--output', f'results/{args.run}/evaluation_final'])
+    evaluation = ['scripts/evaluate_step3.py', '--config', args.config, '--checkpoint', f'results/{args.run}/training_state.pt']
+    plans = ['--plans', 'results/step3_streaming_seed17/evaluation_final/stream_plans.json'] if v2 else []
+    run('stream_evaluation', evaluation+plans+['--output', f'results/{args.run}/evaluation_final'])
+    if v2:
+        run('loiter_evaluation', evaluation+['--plans', 'results/step3_streaming_seed17/loiter_diagnostic/plans.json',
+            '--output', f'results/{args.run}/loiter_diagnostic', '--no-visualize'])
     run('strict_tests_after', ['-m', 'pytest', '-q'], fraction=.16, require_gsplat=True)
     report('GPU pipeline finished. Actual image inspection, scientific report, and commit remain agent tasks.')
 

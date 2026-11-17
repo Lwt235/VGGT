@@ -234,7 +234,7 @@ class SpatialBootstrap(nn.Module):
         confidence = raw[:, 1].sigmoid()
         return rays/dz[:, None]*z[:, None], z, confidence, rays
 
-    def forward(self, tokens_pre_inject, query_features, memory, K, height, width, *, shallow):
+    def forward(self, tokens_pre_inject, query_features, memory, K, height, width, *, shallow, match_mask=None):
         points, z, c_depth, rays = self.camera_observation(tokens_pre_inject, shallow, K, height, width)
         count = len(points)
         eye = torch.eye(4, device=K.device, dtype=K.dtype)
@@ -256,6 +256,8 @@ class SpatialBootstrap(nn.Module):
         q = F.normalize(query_features+self.query_residual(torch.cat((tokens_pre_inject, shallow, rays) if self.metric_scale else (shallow, rays), -1)), dim=-1)
         k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
         logits = q @ k.T*self.log_temperature.exp().clamp(max=60.)+memory.alpha.clamp_min(1e-6).log()[None]
+        if match_mask is not None:
+            logits = logits.masked_fill(~match_mask[None], -80.)
         dustbin = self.dustbin_logit.expand(count, 1)
         if self.ray_bundle:
             dustbin = dustbin+self.dustbin_head(torch.cat((tokens_pre_inject, shallow), -1))
@@ -285,10 +287,10 @@ class SpatialBootstrap(nn.Module):
         T = torch.cat((top, eye[3:]), 0)
         return T, dict(anchors=anchors, confidence=p_match, camera_patch_points=points, z_cam=z, c_depth=c_depth,
             matching_attention=W, dustbin_probability=W[:, -1], bootstrap_attention=inlier,
-            bootstrap_support=torch.ones(len(memory), device=z.device, dtype=torch.bool),
+            bootstrap_support=(torch.ones(len(memory), device=z.device, dtype=torch.bool) if match_mask is None else match_mask),
             anchor_votes=votes, match_mass=p_match.sum(), matching_query=q, matching_keys=k,
             matching_dustbin_logit=dustbin, matching_temperature=self.log_temperature.exp().clamp(max=60.),
-            camera_rays=rays, **extras)
+            camera_rays=rays, **({'matching_mask': match_mask} if match_mask is not None else {}), **extras)
 
 
 class SpatialRefinement(nn.Module):
