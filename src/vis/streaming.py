@@ -155,3 +155,57 @@ def training_curves(folder, rows):
         ax.set(title=key,xlabel='Streaming optimizer updates')
     fig.suptitle('Step 3 · train scenes only, heldout frames excluded')
     save(fig,folder/'stream_training_curves.png')
+
+
+def public_map_diagnostics(folder, sequence, reference_surfaces, map_centers, *, reference_voxel=.03):
+    """Whole-map quality, including old regions outside the final query FOV.
+
+    Ground truth is detached evaluator data only. Two nearest-neighbour
+    distance distributions are diagnostics, never an alignment/pose update.
+    Spatial reference thinning avoids overweighting repeated loiter frames.
+    Center distances do not claim Gaussian-support coverage: a coarse splat
+    can cover a surface whose nearest center is several centimetres away.
+    """
+    from scipy.spatial import cKDTree
+    folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
+    reference=np.asarray(reference_surfaces,dtype=np.float64).reshape(-1,3)
+    if not len(reference) or not np.isfinite(reference).all():
+        raise ValueError('A finite observed GT reference is required for map diagnostics')
+    _,indices=np.unique(np.floor(reference/reference_voxel).astype(np.int64),axis=0,return_index=True)
+    reference=reference[np.sort(indices)]
+    tree=cKDTree(reference)
+    fig,axes=plt.subplots(1,len(map_centers),figsize=(7*len(map_centers),5),layout='constrained',squeeze=False)
+    stats={}
+    def sample(values,limit):
+        return values[np.linspace(0,len(values)-1,min(limit,len(values))).round().astype(int)]
+    plotted_reference=sample(reference,12000)
+    all_clouds=[reference]
+    for label,value in map_centers.items():
+        centers=value.detach().float().cpu().numpy() if hasattr(value,'detach') else np.asarray(value)
+        if not np.isfinite(centers).all():raise FloatingPointError('Nonfinite public-map centers')
+        all_clouds.append(centers)
+    # Entire map extent is retained; large drift is not cropped away.
+    combined=np.concatenate(all_clouds)
+    low,high=combined[:,[0,2]].min(0),combined[:,[0,2]].max(0)
+    for ax,(label,value) in zip(axes[0],map_centers.items()):
+        centers=value.detach().float().cpu().numpy() if hasattr(value,'detach') else np.asarray(value)
+        ax.scatter(plotted_reference[:,0],plotted_reference[:,2],s=.6,c=COLD,alpha=.3,label='Observed GT surfaces; plotting/metrics only')
+        if len(centers):
+            predicted=sample(centers,10000)
+            ax.scatter(predicted[:,0],predicted[:,2],s=1,c=ORANGE,alpha=.5,label='Final public centers AFTER final write')
+            precision=tree.query(centers,workers=1)[0]
+            coverage=cKDTree(centers).query(reference,workers=1)[0]
+            describe=lambda values:dict(mean_m=float(np.mean(values)),median_m=float(np.median(values)),p90_m=float(np.quantile(values,.9)))
+            stats[label]=dict(public_gaussians=len(centers),reference_surface_samples=len(reference),reference_voxel_m=reference_voxel,
+                map_center_to_observed_surface=describe(precision),observed_surface_to_map_center=describe(coverage),
+                definition='Unaligned Euclidean nearest-neighbour distances; center coverage proxy, not Gaussian support')
+            detail=f'Map→surface {np.mean(precision):.3f} m; surface→center {np.mean(coverage):.3f} m'
+        else:
+            stats[label]=dict(public_gaussians=0,reference_surface_samples=len(reference),unavailable_reason='Empty final public memory')
+            detail='Empty final public memory'
+        ax.set(xlabel='World x [m]',ylabel='World z [m]',xlim=(low[0]-.1,high[0]+.1),ylim=(low[1]-.1,high[1]+.1),
+            title=f'{label} · {len(centers)} public primitives\n{detail}')
+        ax.set_aspect('equal',adjustable='box');ax.legend(fontsize=7)
+    fig.suptitle('V1 · '+sequence+' · complete public map, fixed seed gauge; no fitting or alignment')
+    save(fig,folder/'V1_global_public_map.png')
+    return stats

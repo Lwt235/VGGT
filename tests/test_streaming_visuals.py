@@ -94,3 +94,17 @@ def test_evaluator_seed_visibility_preserves_zero_overlap_and_exact_replay():
     assert seed_surface_overlap(dataset,plan,430)==0.
     assert seed_surface_overlap(dataset,plan,797)==.30
     assert seed_surface_overlap(dataset,plan,31)==1.
+
+
+def test_whole_public_map_diagnostic_keeps_offset_and_old_region_coverage(tmp_path):
+    from src.vis.streaming import public_map_diagnostics
+    y,x=np.meshgrid(np.linspace(-1,1,20),np.linspace(-2,2,40),indexing='ij')
+    truth=np.stack((x,y,np.ones_like(x)*3),-1).reshape(-1,3)
+    shifted=truth+np.array([0.,0.,.3])
+    local=truth[truth[:,0]>1.]
+    result=public_map_diagnostics(tmp_path,'Synthetic test fixture; not measured data',truth,
+        {'Exact':truth,'Displaced':shifted,'Local only':local})
+    assert result['Exact']['map_center_to_observed_surface']['mean_m']<1e-6
+    assert result['Displaced']['map_center_to_observed_surface']['mean_m']>.29
+    assert result['Local only']['observed_surface_to_map_center']['mean_m']>.9
+    assert (tmp_path/'V1_global_public_map.png').stat().st_size>20000

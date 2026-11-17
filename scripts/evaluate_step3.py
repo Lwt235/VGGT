@@ -19,7 +19,7 @@ import yaml
 from src.data import Supervision
 from src.geometry import invert_se3, transform_points, intrinsics_cv_to_edge
 from src.losses.world import pose_errors
-from src.vis.streaming import v6, metric_curves, summarize_rows, v1_comparison, training_curves
+from src.vis.streaming import v6, metric_curves, summarize_rows, v1_comparison, training_curves, public_map_diagnostics
 from src.vis.step2 import dump_json
 
 C11='harvard_c11/hv_c11_2'
@@ -167,19 +167,21 @@ def representative_figures(engine,dataset,plan,t,query,target,memory,full,folder
 def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
     """Every engine step below receives RGB/K + prior 3-D state only."""
     from src.streaming import StreamingEngine
-    records={};snapshots={};map_snapshots={};seed_reference=None
+    records={};snapshots={};map_snapshots={};final_centers={};gt_surfaces=[];seed_reference=None
     for label,window in (('Full persistent',None),('Sliding Window W=4',4)):
         runner=StreamingEngine(engine.model,window=window).to(next(engine.parameters()).device).eval()
         # Share the trained stream-specific gates/fusion too, not only VGGT.
         runner.load_state_dict(engine.state_dict(),strict=True)
         observations=iter(dataset.load_stream(plan['scene'],plan['frame_ids'],device=next(engine.parameters()).device)['observations'])
         q0,t0=next(observations);state=runner.seed(q0,t0.depth,t0.valid)
+        if window is None:gt_surfaces.append(t0.world_points[t0.valid][::4].detach().float().cpu().numpy())
         seed_reference=cpu_target(t0);del q0,t0
         rows=[]
         representative=len(plan['frame_ids'])-1
         for t,(query,target) in enumerate(observations,1):
             old_memory=state.memory
             full,state=runner(query,state,return_attention=visualize and t==representative and window is None)
+            if window is None:gt_surfaces.append(target.world_points[target.valid][::4].detach().float().cpu().numpy())
             row=dict(t=t,frame_id=plan['frame_ids'][t],phase=plan['phases'][t],memory_before=len(old_memory),memory_after=len(state.memory),
                 active_count=int(full.get('active_count',len(full.get('attention',{}).get('indices',[])))),**prediction_metrics(full,target))
             row['seed_rgbd_surface_overlap']=seed_surface_overlap(dataset,plan,row['frame_id'])
@@ -199,6 +201,7 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
             if t%10==0:print(plan['name'],label,t,'/',len(plan['frame_ids'])-1,'memory',len(state.memory),'EPE',round(row['point_epe_m'],3),flush=True)
             del full,old_memory,query,target
         records[label]=rows
+        final_centers[label]=state.memory.means.detach().float().cpu()
         # Latest metrics only, no Gaussian/checkpoint snapshots per frame.
         dump_json(folder/(('persistent' if window is None else 'sliding_window')+'_metrics.json'),dict(plan=plan,rows=rows,summary=summarize_rows(rows)))
         del state,runner
@@ -206,6 +209,7 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
     v6(folder/'vis',plan['name'],records,patch_tokens=dataset.image_hw[0]*dataset.image_hw[1]//196)
     metric_curves(folder/'vis',plan['name'],records)
     wall=v1_comparison(folder/'vis',plan['name'],seed_reference,last_target,snapshots,memories=map_snapshots)
+    map_quality=public_map_diagnostics(folder/'vis',plan['name'],np.concatenate(gt_surfaces),final_centers)
     summary={label:summarize_rows(rows) for label,rows in records.items()}
     for label,rows in records.items():
         tail=rows[-1]
@@ -214,6 +218,7 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
             predicted_seed_to_endpoint_distance_m=float(np.linalg.norm(np.array(tail['predicted_c2w'])[:3,3])),
             definition='End pose versus actual GT endpoint in seed gauge; endpoint is not assumed to equal seed')
         summary[label]['wall']=wall[label]
+        summary[label]['public_map_quality']=map_quality[label]
         summary[label]['memory']=dict(final=rows[-1]['memory_after'],maximum=max(r['memory_after'] for r in rows),maximum_active=max(r['active_count'] for r in rows),
             loiter_start=next((r['memory_before'] for r in rows if r['phase']=='Loiter'),None),loiter_end=next((r['memory_after'] for r in reversed(rows) if r['phase']=='Loiter'),None))
     dump_json(folder/'comparison.json',dict(plan=plan,variants=summary))

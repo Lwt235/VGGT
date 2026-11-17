@@ -161,6 +161,15 @@ def build_report(evaluation,training_log):
                 f"Mean write confidence distribution: {stats_text(detail['mean_write_confidence'])}; conservative pose gate: {stats_text(detail['mean_pose_gate'])}.",
                 f"Fixed GT reference-plane query-only wall P90–P10: {fmt(detail['wall_p90_p10_m'])} m; balanced seed/query union P90–P10 (including displaced double layers): {fmt(detail['seed_query_union_p90_p10_m'])} m; signed median query wall bias: {fmt(detail['wall_signed_bias_m'])} m."]
             if wall.get('unavailable_reason'):extras.append('Wall section unavailable: '+wall['unavailable_reason']+'.')
+            map_quality=stream['variants'][variant].get('public_map_quality',{})
+            if 'map_center_to_observed_surface' in map_quality:
+                precision=map_quality['map_center_to_observed_surface'];coverage=map_quality['observed_surface_to_map_center']
+                extras.append(f"Final map center→observed GT surface distance mean/median/P90: {fmt(precision['mean_m'])}/{fmt(precision['median_m'])}/{fmt(precision['p90_m'])} m; observed surface→map center proxy: {fmt(coverage['mean_m'])}/{fmt(coverage['median_m'])}/{fmt(coverage['p90_m'])} m. GT reference uses {fmt(map_quality['reference_voxel_m'])} m spatial thinning; these diagnostics never update poses and are not Gaussian-support coverage.")
+                for direction in ('map_center_to_observed_surface','observed_surface_to_map_center'):
+                    values=map_quality[direction]
+                    tables.append(dict(category='public_map_quality',**base,variant=variant,phase='All',metric=direction,
+                        count=map_quality['public_gaussians'] if direction.startswith('map_center') else map_quality['reference_surface_samples'],
+                        mean=values['mean_m'],median=values['median_m'],p90=values['p90_m'],value=None))
             if seed_overlap is not None:
                 extras.append(f"Seed RGB-D surface visibility (mean/median/P90): {stats_text(seed_overlap)}; {detail['below_one_percent_seed_surface_overlap_queries']} queries have <1% initial-seed surface visibility. This fixed split diagnostic uses decoded-depth z agreement, not Gaussian 3-sigma support, and is never a model input.")
             if plan['scene'].startswith('harvard_c11/') and 'natural' in plan['name']:
