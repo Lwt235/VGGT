@@ -120,3 +120,29 @@ def test_checkpoint_retains_only_latest_and_final_hardlink(tmp_path, monkeypatch
     assert checkpoint['step'] == 3
     assert checkpoint['base_checkpoint'] == config['base_checkpoint']
     assert checkpoint['trainable'].keys() == dict(engine.named_parameters()).keys()
+
+
+def test_resume_replays_interrupted_metric_tail_without_duplicate_updates(tmp_path):
+    import json
+    from scripts.train_step3 import reconcile_metrics_for_resume
+    path=tmp_path/'metrics.jsonl'
+    path.write_text(''.join(json.dumps(dict(step=i,loss=1/i))+'\n' for i in range(1,6)))
+    with path.open('a') as handle:handle.write('{"step":6,"loss":')
+    reconcile_metrics_for_resume(tmp_path,3)
+    assert [json.loads(line)['step'] for line in path.read_text().splitlines()]==[1,2,3]
+    interrupted=(tmp_path/'metrics_interrupted.jsonl').read_text()
+    assert '"step": 4' in interrupted and '"step": 5' in interrupted and '"step":6' in interrupted
+    with path.open('a') as handle:
+        for i in (4,5):handle.write(json.dumps(dict(step=i,loss=1/i))+'\n')
+    reconcile_metrics_for_resume(tmp_path,5)
+    assert [json.loads(line)['step'] for line in path.read_text().splitlines()]==[1,2,3,4,5]
+    assert not (tmp_path/'metrics.jsonl.tmp').exists()
+
+
+def test_resume_rejects_missing_checkpoint_metric_prefix(tmp_path):
+    from scripts.train_step3 import reconcile_metrics_for_resume
+    with pytest.raises(ValueError,match='no corresponding metric prefix'):
+        reconcile_metrics_for_resume(tmp_path,3)
+    (tmp_path/'metrics.jsonl').write_text('{"step":1}\n{"step":3}\n')
+    with pytest.raises(ValueError,match='do not agree'):
+        reconcile_metrics_for_resume(tmp_path,3)

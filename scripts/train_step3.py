@@ -152,6 +152,40 @@ def restore_optimizer_rng(engine, optimizer, scheduler, checkpoint, config):
     return checkpoint['step']
 
 
+def reconcile_metrics_for_resume(folder, completed_step):
+    """Replay only updates after the checkpoint; keep their old logs separate.
+
+    A crash may leave flushed metrics ahead of atomic latest. Those updates
+    will be recomputed from restored optimizer/RNG state and must not appear
+    twice in the canonical convergence curve. Interrupted metrics remain as
+    ordinary diagnostic logs, never as checkpoints or model inputs.
+    """
+    path = folder/'metrics.jsonl'
+    if not path.exists():
+        if completed_step:
+            raise ValueError('Saved streaming state has no corresponding metric prefix')
+        return
+    prefix, interrupted = [], []
+    for line in path.read_text().splitlines(keepends=True):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            interrupted.append(line)
+            continue
+        if record['step'] <= completed_step:
+            prefix.append((record['step'], line))
+        else:
+            interrupted.append(line)
+    if [step for step, _ in prefix] != list(range(1, completed_step+1)):
+        raise ValueError('Checkpoint and streaming metric prefix do not agree')
+    if interrupted:
+        with (folder/'metrics_interrupted.jsonl').open('a') as handle:
+            handle.writelines(line if line.endswith('\n') else line+'\n' for line in interrupted)
+        temporary = folder/'metrics.jsonl.tmp'
+        temporary.write_text(''.join(line if line.endswith('\n') else line+'\n' for _,line in prefix))
+        temporary.replace(path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='configs/step3_streaming.yaml')
@@ -183,6 +217,7 @@ def main():
         checkpoint = load_checkpoint_readonly(folder/'training_state.pt')
         start = restore_optimizer_rng(engine, optimizer, scheduler, checkpoint, config)
         del checkpoint
+        reconcile_metrics_for_resume(folder, start)
     (folder/'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
     print('Step3 Full18k spatial adaptation; train clips:', {sid:len(w) for sid,w in dataset.training_windows.items()}, flush=True)
     print('Trainable parameters:', sum(p.numel() for p in engine.parameters() if p.requires_grad),
