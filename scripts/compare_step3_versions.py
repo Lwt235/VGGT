@@ -140,7 +140,7 @@ def compare(baseline, updated, destination, *, third=None):
         if any(loiter_plans != read(path) for path in loiter_paths[1:]):
             raise ValueError('Extended loiter plans changed')
         loiter=[]
-        fig,axes=plt.subplots(1,2,figsize=(12,4))
+        fig,axes=plt.subplots(1,3,figsize=(16,4))
         for p in loiter_plans:
             for version,folder in versions.items():
                 for variant,filename in (('Full','persistent_metrics.json'),('W4','sliding_window_metrics.json')):
@@ -158,9 +158,15 @@ def compare(baseline, updated, destination, *, third=None):
                         last20_candidates=(sum(r['write_checks']['candidates'] for r in selected[-20:])
                             if 'write_checks' in selected[-1] else None),
                         final_translation_m=current[-1]['translation1_m']))
-                    for ax,field in zip(axes,('memory_after','point_epe_m')):
-                        ax.plot([r['t'] for r in current],[r[field] for r in current],label=f'{version} {variant}')
-        for ax,title in zip(axes,('PUBLIC count (read budget is separate)','World EPE [m]')):
+                    steps = [r['t'] for r in current]
+                    label = f'{version} {variant}'
+                    line, = axes[0].plot(steps, [r['memory_after'] for r in current], label=label)
+                    axes[1].plot(steps, [r['point_epe_m'] for r in current], label=label, color=line.get_color())
+                    if 'write_checks' in current[-1]:
+                        axes[2].plot(steps, [r['write_checks']['candidates'] for r in current],
+                                     label=label, color=line.get_color())
+        for ax,title in zip(axes,('PUBLIC count (read budget is separate)','World EPE [m]',
+                                 'Write candidates (v1 not recorded)')):
             ax.axvspan(20,79,color='.85',alpha=.3,label='Loiter');ax.set(title=title,xlabel='t');ax.legend(fontsize=8);ax.grid(alpha=.2)
         fig.tight_layout();fig.savefig(destination/f'{prefix}_extended_loiter.png',dpi=150);plt.close(fig)
         combined['extended_loiter']=loiter
