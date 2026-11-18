@@ -11,6 +11,7 @@ from src.data import QueryInput
 from src.geometry import patch_intrinsics, transform_points, world_rays
 from src.memory.gaussians import GaussianMemory, SpatialMomentFusion, TokenGaussianWriter
 from src.models.ellipsoid_pose import anisotropic_ray_pose, local_se3_exp
+from src.models.spatial_pose import SpatialBootstrap
 from src.models.stream_tracking import select_stream_pose, tracking_logit_prior
 from src.readout.render import RenderedMemory
 from src.streaming_data_v2 import StridedStreamingDataset
@@ -43,34 +44,41 @@ def fixture():
 def test_verified_partial_seed_overlap_has_priority_under_world_gauge_change():
     h, w, rays, anchors = fixture()
     visible = torch.arange(h*w) < 44
-    seed_mask = torch.arange(2*h*w) < int(visible.sum())
+    query_features = torch.eye(h*w)
+    seed_count = int(visible.sum())
+    local_memory = torch.cat((anchors[visible], anchors+torch.tensor([2., 0., 0.])))
+    features = torch.cat((query_features[visible], query_features))
+    seed_mask = torch.arange(len(local_memory)) < seed_count
+    solver = SpatialBootstrap(token_dim=8, latent_dim=h*w, ray_bundle=True,
+                              anisotropic=True, metric_scale=True, planar_safe=True)
+    solver.camera_observation = lambda *_: (anchors, anchors[:, 2], torch.ones(h*w), rays)
+    tokens = torch.zeros(h*w, 8)
     world = torch.eye(4)
     world[:3, :3], _ = local_se3_exp(torch.tensor([.5, .1, -.3]), torch.zeros(3))
     world[:3, 3] = torch.tensor([1.4, -2., .3])
+    poses = []
     for gauge in (torch.eye(4), world):
-        full = spatial(transform_points(torch.cat((anchors, anchors+2)), gauge))
+        full = spatial(transform_points(local_memory, gauge), features)
         previous = gauge.clone()
         previous[:3, 3] += gauge[:3, 0]*2
         calls = []
 
-        def solve(*args, **kwargs):
-            calls.append(kwargs)
-            candidate = gauge if 'match_mask' in kwargs else previous
-            match = torch.where(visible, .95, .01) if 'match_mask' in kwargs else torch.full_like(visible,.95,dtype=torch.float)
-            return candidate, dict(anchors=transform_points(anchors, candidate),
-                posterior_covars=spatial(anchors).covars, camera_rays=rays, dustbin_probability=1-match)
-
         def raster(memory, pose, *_):
-            mask = visible if len(memory) == int(seed_mask.sum()) else torch.arange(h*w)<174
-            return render(transform_points(anchors, pose), mask, h, w)
+            calls.append(len(memory))
+            mask = visible if len(memory) == seed_count else torch.arange(h*w)<174
+            rasterized = render(transform_points(anchors, pose), mask, h, w)
+            return RenderedMemory(rasterized.world, query_features.reshape(h,w,-1), rasterized.depth,
+                                  rasterized.depth_variance, rasterized.opacity)
 
-        model = SimpleNamespace(initial_pose=solve, render_reader=SimpleNamespace(render=raster))
-        pose, out = select_stream_pose(model, None, None, torch.ones(h*w, 4), full, torch.eye(3),
+        model = SimpleNamespace(initial_pose=solver, render_reader=SimpleNamespace(render=raster))
+        pose, out = select_stream_pose(model, tokens, tokens, query_features, full, intrinsics(),
                                        h, w, previous, seed_mask)
-        assert len(calls) == 1 and torch.equal(calls[0]['match_mask'], seed_mask)
+        assert calls == [seed_count] and torch.equal(out['matching_mask'], seed_mask)
         assert out['stream_pose_source'] == 'seed'
-        assert out['stream_pose_evidence']['seed']['inliers'] == 44
-        torch.testing.assert_close(pose, gauge)
+        assert out['stream_pose_evidence']['seed']['inliers'] == seed_count
+        torch.testing.assert_close(pose, gauge, atol=5e-3, rtol=0)
+        poses.append(pose)
+    torch.testing.assert_close(poses[1], world @ poses[0], atol=2e-5, rtol=0)
 
 
 def test_tracking_prior_and_lm_keep_small_motion_instead_of_symmetric_far_wall():
