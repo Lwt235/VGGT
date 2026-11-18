@@ -105,10 +105,11 @@ def main():
         report('Completed '+stage)
 
     def train(profile):
+        minimum_free_mib = 18432 if revision == 'v4' else 20480
         while True:
-            cards = checked(args.gpus,.28)
+            cards = checked(args.gpus,.28,minimum_free_mib)
             if len(cards) >= args.minimum_training_gpus:break
-            report(f'Waiting for {args.minimum_training_gpus} GPUs with >=20 GiB free')
+            report(f'Waiting for {args.minimum_training_gpus} GPUs with >={minimum_free_mib//1024} GiB free')
             time.sleep(30)
         env = os.environ.copy()
         env.update(CUDA_VISIBLE_DEVICES=','.join(g.uuid for g in cards),
