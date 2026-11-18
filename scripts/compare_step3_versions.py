@@ -70,7 +70,10 @@ def compare(baseline, updated, destination, *, third=None):
                                            for source in ('seed', 'track', 'global')},
                     mean_consensus=float(np.mean([c['rigid_consensus'] for c in checks])),
                     locked_seed_drift_max_m=max((r['seed_geometry_drift_max_m'] or 0 for r in current), default=0),
-                    wrong_high_write_frames=sum(r['translation1_m'] > 1 and r['write_checks']['frame_quality'] > .4 and r['write_checks']['candidates'] > 0 for r in current))
+                    wrong_write_frames=sum(r['translation1_m'] > 1 and c['candidates'] > 0
+                                           for r, c in zip(current, checks)),
+                    wrong_high_write_frames=sum(r['translation1_m'] > 1 and c['mean_confidence'] > .4 and c['candidates'] > 0
+                                                for r, c in zip(current, checks)))
             entry['variants'][label] = metrics
         if plan['kind'].startswith('natural') and 'harvard_c11' in plan['scene']:
             entry['return_frames'] = {label:[r for r in current if r['frame_id'] in (781,797)] for label,current in rows.items()}

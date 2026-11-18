@@ -147,19 +147,23 @@ def training_curves(folder, rows):
     if not rows:return
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
     fig,axes=plt.subplots(1,3,figsize=(13,4),layout='constrained')
+    parallel = [r for r in rows if r.get('distributed_world_size', 1) > 1]
+    parallel_from_start = bool(parallel and parallel[0]['step'] == rows[0]['step'])
     for ax,key in zip(axes,('loss','point_epe_m','mean_write_confidence')):
         values=[r for r in rows if key in r]
         ax.plot([r['step'] for r in values],[r[key] for r in values],alpha=.3)
         if len(values)>=40:
             ax.plot([r['step'] for r in values][39:],np.convolve([r[key] for r in values],np.ones(40)/40,'valid'))
-        parallel=[r for r in rows if r.get('distributed_world_size',1)>1]
-        if parallel:
+        if parallel and not parallel_from_start:
             first=parallel[0]
             ax.axvline(first['step'],color='#8b4a9c',ls='--',lw=1)
             ax.text(first['step'],.97,f"DDP: {first['distributed_world_size']} trajectories/update",
                 transform=ax.get_xaxis_transform(),ha='right',va='top',fontsize=7,color='#8b4a9c')
         ax.set(title=key,xlabel='Streaming optimizer updates')
-    fig.suptitle('Step 3 · train scenes only, heldout frames excluded')
+    title = 'Step 3 · train scenes only, heldout frames excluded'
+    if parallel_from_start:
+        title += f" · DDP: {parallel[0]['distributed_world_size']} trajectories/update initially"
+    fig.suptitle(title)
     save(fig,folder/'stream_training_curves.png')
 
 
