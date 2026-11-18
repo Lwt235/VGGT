@@ -50,7 +50,12 @@ def load_engine(config, checkpoint=None, device='cuda'):
     # StreamingMomentFusion is a separate stateful moment update module; the
     # offline mapping fusion is only its immutable Full18k initialization.
     model.fusion.requires_grad_(False)
-    if config.get('streaming_revision') == 'v3':
+    if config.get('streaming_revision') == 'v4':
+        from src.streaming_v4 import StreamingEngineV4
+        if base_path != (PROJECT_ROOT/'results/step2_v5_full_seed17/training_state_18000.pt').resolve():
+            raise ValueError('Step3 v4 must initialize from the fixed Full18k checkpoint')
+        engine = StreamingEngineV4(model)
+    elif config.get('streaming_revision') == 'v3':
         from src.streaming_v3 import StreamingEngineV3
         engine = StreamingEngineV3(model)
     elif config.get('streaming_revision') == 'v2':
@@ -107,14 +112,21 @@ def build_optimizer(engine, config):
     return optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
 
-def criterion(output, target, config):
-    return world_loss(output, target,
+def criterion(output, target, config, *, seed_surface_overlap=None):
+    loss, metrics = world_loss(output, target,
         camera_weight=config['camera_alignment_weight'],
         refinement_safety_weight=config['refinement_safety_weight'],
         anchor_weight=config['anchor_alignment_weight'], matching_weight=config['matching_weight'],
         depth_weight=config['patch_depth_weight'], relative_depth_weight=config['relative_depth_weight'],
         anchored_camera_weight=config['anchored_camera_weight'],
         anchored_relative_depth_weight=config['anchored_relative_depth_weight'])
+    if config.get('streaming_revision') == 'v4':
+        from src.losses.world import seed_partial_matching_loss
+        extra, used = seed_partial_matching_loss(output.get('seed_match_auxiliary'),target,seed_surface_overlap)
+        loss = loss+config['seed_matching_weight']*extra
+        metrics.update(loss=float(loss.detach()),seed_correspondence_loss=float(extra.detach()),
+                       seed_supervision_enabled=float(used))
+    return loss,metrics
 
 
 def checkpoint_bytes(engine):
@@ -220,6 +232,8 @@ def main():
     folder = (PROJECT_ROOT/'results'/args.run).resolve()
     if not folder.is_relative_to(PROJECT_ROOT/'results') or (folder.exists() and not args.resume):
         parser.error('Use a new Step3 project directory, or resume its own state')
+    if config.get('streaming_revision') == 'v4' and not folder.name.startswith('step3_v4_'):
+        parser.error('Step3 v4 requires its own run directory')
     if not os.environ.get('VGGT_GPU_MEMORY_FRACTION'):
         parser.error('Use run_on_available_gpu.py after live GPU/process checks')
     if not config['native_frozen']:
@@ -227,7 +241,7 @@ def main():
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank, local_rank = int(os.environ.get('RANK', '0')), int(os.environ.get('LOCAL_RANK', '0'))
     distributed = world_size > 1
-    long_stream = config.get('streaming_revision') in ('v2', 'v3')
+    long_stream = config.get('streaming_revision') in ('v2', 'v3', 'v4')
     if distributed and not long_stream:
         parser.error('DDP requires the detachable long-stream 3D state')
     torch.cuda.set_device(local_rank)
@@ -247,7 +261,10 @@ def main():
     if long_stream:
         from src.streaming_data_v2 import StridedStreamingDataset
         dataset_type = StridedStreamingDataset
-    options = {'jump_revisits': True} if config.get('streaming_revision') == 'v3' else {}
+    revision = config.get('streaming_revision')
+    options = {'jump_revisits': True} if revision in ('v3','v4') else {}
+    if revision == 'v4':
+        options['query_to_seed_overlap'] = True
     dataset = dataset_type(PROJECT_ROOT/config['split'], config['image_hw'],
         config['minimum_frames'], config['maximum_frames'], **options)
     engine = load_engine(config, device=f'cuda:{local_rank}').train()
@@ -306,7 +323,12 @@ def main():
                 segment_count = math.ceil((config['maximum_frames']-1)/tbptt)
                 for segment_index in range(segment_count):
                     frames = list(itertools.islice(observations, tbptt))
-                    segment, state, info = segment_runner(frames, state, seed, total_queries)
+                    if revision == 'v4':
+                        start_index = 1+segment_index*tbptt
+                        overlaps = stream['seed_surface_overlap'][start_index:start_index+len(frames)]
+                        segment,state,info = segment_runner(frames,state,seed,total_queries,overlaps)
+                    else:
+                        segment,state,info = segment_runner(frames,state,seed,total_queries)
                     seed = None
                     if not torch.isfinite(segment):
                         raise RuntimeError('Nonfinite distributed streaming loss')
@@ -328,7 +350,8 @@ def main():
                     # This is the only inference call after the seed. Ground truth
                     # remains exclusively on the following criterion line.
                     output, state = engine(query, state)
-                    loss, metrics = criterion(output, target, config)
+                    overlap = stream['seed_surface_overlap'][frame_index] if revision == 'v4' else None
+                    loss,metrics = criterion(output,target,config,seed_surface_overlap=overlap)
                     losses.append(loss)
                     measurements.append(metrics)
                     sizes.append(len(state.memory))
@@ -355,6 +378,8 @@ def main():
             optimizer.step(); scheduler.step(); torch.cuda.synchronize()
             keys = ('point_epe_m','point_l1_m','rotation0_deg','rotation1_deg','translation0_m','translation1_m',
                     'dustbin_mean','surface_support_rate','anchored_camera_epe_m')
+            if revision == 'v4':
+                keys += ('seed_correspondence_loss','seed_supervision_enabled')
             record = dict(step=step+1, scene=stream['scene'], mode=stream['mode'], frame_ids=stream['frame_ids'],
                 frames=len(stream['frame_ids']), loss=float(loss.detach()),
                 tbptt_frames=tbptt, source_indices=stream.get('source_indices'),

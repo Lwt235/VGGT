@@ -4,12 +4,14 @@ from src.streaming_data import StreamingDataset
 
 
 class StridedStreamingDataset(StreamingDataset):
-    def __init__(self, split_path, image_hw, minimum_frames=12, maximum_frames=16, *, jump_revisits=False):
+    def __init__(self, split_path, image_hw, minimum_frames=12, maximum_frames=16, *,
+                 jump_revisits=False, query_to_seed_overlap=False):
         if not 12 <= minimum_frames <= maximum_frames <= 16:
             raise ValueError('Long streaming clips require 12–16 observations')
         super().__init__(split_path, image_hw)
         self.minimum_frames, self.maximum_frames = minimum_frames, maximum_frames
         self.jump_revisits = jump_revisits
+        self.query_to_seed_overlap = query_to_seed_overlap
         self.graphs, self.longest = {}, {}
         self.training_examples = []
         for sid, item in self.sequences.items():
@@ -60,7 +62,9 @@ class StridedStreamingDataset(StreamingDataset):
                 mode = 'jump_revisit'
         frames = [item['frame_ids'][i] for i in indices]
         result = self.load_stream(sid, frames, device=device, training=True)
+        overlap = item['surface_overlap']
         result.update(mode=mode, source_indices=indices,
             strides=[abs(b-a) for a,b in zip(indices, indices[1:])],
-            seed_surface_overlap=[1. if i == start else item['surface_overlap'][start][i] for i in indices])
+            seed_surface_overlap=[1. if i == start else (overlap[i][start] if self.query_to_seed_overlap else
+                                                        overlap[start][i]) for i in indices])
         return result

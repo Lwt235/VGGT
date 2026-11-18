@@ -80,7 +80,7 @@ class RenderReader(nn.Module):
         gamma = gamma.clamp(.25, 4.)
         return gamma*camera_points, gamma
 
-    def anchor_camera_geometry(self, camera_points, rendered, K_cv):
+    def anchor_camera_geometry(self, camera_points, rendered, K_cv, *, reliability=None):
         """Local O5 metric depth correction along calibrated camera rays.
 
         A learned reliability head uses O5 latent/depth moments and current
@@ -114,6 +114,8 @@ class RenderReader(nn.Module):
             return camera_points*(1+scale[..., None]), confidence
         modulation = .65+.35*confidence if self.physical_local else confidence
         correction = modulation*rendered.opacity/(1+variance)*(rendered.depth-native_depth)
+        if reliability is not None:
+            correction = correction*reliability
         correction = F.interpolate(correction.permute(2, 0, 1)[None], size=(h, w), mode='bilinear', align_corners=False)[0, 0]
         from src.geometry import pixel_grid
         grid = pixel_grid(h, w, device=K_cv.device, dtype=K_cv.dtype, center=0.)

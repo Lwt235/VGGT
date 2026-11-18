@@ -31,12 +31,17 @@ class DeepEllipsoidRefinement(nn.Module):
         query = F.normalize(bootstrap['matching_query']+self.query_delta(final), dim=-1)
         logits = query @ bootstrap['matching_keys'].T*bootstrap['matching_temperature']
         logits = logits+memory.alpha.clamp_min(1e-6).log()[None]
-        if 'matching_prior' in bootstrap:
-            logits = logits+bootstrap['matching_prior']
-        if bootstrap.get('matching_mask') is not None:
-            logits = logits.masked_fill(~bootstrap['matching_mask'][None], -80.)
         dustbin = bootstrap['matching_dustbin_logit']+self.dustbin_delta(final)
-        W = torch.cat((logits, dustbin), -1).softmax(-1)
+        if 'matching_column_competition' in bootstrap:
+            from src.models.stream_tracking_v4 import open_attention
+            W = open_attention(logits,dustbin,mutual=bootstrap['matching_column_competition'],
+                               memory_mask=bootstrap['matching_mask'],pair_mask=bootstrap['matching_pair_mask'])
+        else:
+            if 'matching_prior' in bootstrap:
+                logits = logits+bootstrap['matching_prior']
+            if bootstrap.get('matching_mask') is not None:
+                logits = logits.masked_fill(~bootstrap['matching_mask'][None], -80.)
+            W = torch.cat((logits, dustbin), -1).softmax(-1)
         p_match = 1-W[:, -1]
         inlier = W[:, :-1]/p_match[:, None].clamp_min(1e-6)
         anchors, covars = posterior_ellipsoids(inlier, memory, isotropic=self.isotropic)

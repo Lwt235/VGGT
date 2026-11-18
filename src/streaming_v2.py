@@ -32,6 +32,8 @@ def detached_memory(memory):
 def detach_state(state):
     """TBPTT cuts the graph, never the public spatial memory or write history."""
     tracking = {'prev_pose': state.prev_pose.detach()} if hasattr(state, 'prev_pose') else {}
+    if hasattr(state,'older_pose'):
+        tracking['older_pose'] = None if state.older_pose is None else state.older_pose.detach()
     return replace(state, memory=detached_memory(state.memory), support=state.support.detach(),
         window_entries=tuple(SpatialWrite(detached_memory(e.memory), e.support.detach(), e.step) for e in state.window_entries),
         last_write_pose=None if state.last_write_pose is None else state.last_write_pose.detach(), **tracking)

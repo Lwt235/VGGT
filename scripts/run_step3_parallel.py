@@ -70,9 +70,13 @@ def main():
         parser.error('A fresh training run requires a new results directory')
     import yaml
     config = yaml.safe_load((ROOT/args.config).read_text())
-    if config.get('streaming_revision') == 'v3' and (
-            not args.run.startswith('step3_v3_') or not args.protocol.startswith('step3_v3_')):
-        parser.error('v3 requires its own run and protocol directories')
+    revision = config.get('streaming_revision')
+    if revision in ('v3','v4') and (
+            not run_root.name.startswith(f'step3_{revision}_') or not folder.name.startswith(f'step3_{revision}_')):
+        parser.error(f'{revision} requires its own run and protocol directories')
+    if revision == 'v4' and args.stage in ('train','all','profile') and (
+            args.gpus != 3 or args.minimum_training_gpus != 3):
+        parser.error('Step3 v4 training requires exactly three ranks')
     folder.mkdir(exist_ok=True)
     lock = (folder/'parallel_pipeline.lock').open('a')
     fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)

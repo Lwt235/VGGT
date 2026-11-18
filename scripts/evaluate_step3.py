@@ -129,11 +129,12 @@ def display_shells(folder,scene,memory,max_shells=256):
 
 
 @torch.no_grad()
-def read_only(engine,query,memory,*,return_attention=False,support=None,previous_pose=None,seed_lock=None):
+def read_only(engine,query,memory,*,return_attention=False,support=None,previous_pose=None,seed_lock=None,older_pose=None):
     if hasattr(engine,'read'):
         if previous_pose is not None:
+            motion = {} if older_pose is None else {'older_pose':older_pose}
             return engine.read(query,memory,return_attention=return_attention,
-                               previous_pose=previous_pose,seed_lock=seed_lock)
+                               previous_pose=previous_pose,seed_lock=seed_lock,**motion)
         if support is not None:
             return engine.read(query,memory,return_attention=return_attention,support=support)
         return engine.read(query,memory,return_attention=return_attention)
@@ -142,16 +143,16 @@ def read_only(engine,query,memory,*,return_attention=False,support=None,previous
 
 @torch.no_grad()
 def representative_figures(engine,dataset,plan,t,query,target,memory,full,folder,*,support=None,
-                           previous_pose=None,seed_lock=None):
+                           previous_pose=None,seed_lock=None,older_pose=None):
     """Interventions are read-only branches, never committed into the stream."""
     from scripts.train_step2 import intervention_box,erasure_metrics
     from src.vis.smoke import v1,v3,v4,v5
     folder.mkdir(parents=True,exist_ok=True)
     empty=read_only(engine,query,memory.subset(slice(0,0)),support=None if support is None else support[:0],
-                    previous_pose=previous_pose,seed_lock=None if seed_lock is None else seed_lock[:0])
+                    previous_pose=previous_pose,seed_lock=None if seed_lock is None else seed_lock[:0],older_pose=older_pose)
     box=intervention_box(memory,target);partial,mask=memory.erase_box(*box)
     erased=read_only(engine,query,partial,support=None if support is None else support[~mask],
-                     previous_pose=previous_pose,seed_lock=None if seed_lock is None else seed_lock[~mask])
+                    previous_pose=previous_pose,seed_lock=None if seed_lock is None else seed_lock[~mask],older_pose=older_pose)
     # Reload only one seed for this offline figure. No engine ever stores it.
     seed=next(iter(dataset.load_stream(plan['scene'],[plan['frame_ids'][0]],device=query.rgb.device)['observations']))
     scene=dict(name=plan['name']+f' / t={t}; pre-write map',mapping=[seed])
@@ -191,6 +192,7 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
             old_memory=state.memory
             old_support=state.support if hasattr(state,'seed_lock') else None
             previous_pose=getattr(state,'prev_pose',None)
+            older_pose=getattr(state,'older_pose',None)
             seed_lock=getattr(state,'seed_lock',None)
             full,state=runner(query,state,return_attention=visualize and t==representative and window is None)
             if window is None:gt_surfaces.append(target.world_points[target.valid][::4].detach().float().cpu().numpy())
@@ -200,6 +202,11 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
             row['predicted_c2w']=full['T1'].cpu().tolist();row['target_c2w']=target.c2w.cpu().tolist()
             if old_support is not None:
                 row['write_checks']=full['write']
+                evidence=full['write'].get('pose_evidence',{}).get('seed')
+                if evidence and 'candidate_c2w' in evidence:
+                    candidate=target.c2w.new_tensor(evidence['candidate_c2w'])
+                    r_seed,t_seed=pose_errors(candidate,target.c2w)
+                    row['seed_candidate_errors']=dict(rotation_deg=float(r_seed),translation_m=float(t_seed))
                 row['mean_support']=float(state.support.mean()) if len(state.support) else 0.
                 row['seed_locked_gaussians']=int(state.seed_lock.sum())
                 row['seed_geometry_drift_max_m']=(float((state.memory.means[state.seed_lock]-seed_geometry).norm(dim=-1).max())
@@ -214,7 +221,7 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
                     (old_memory.means,old_memory.covars,old_memory.alpha,old_memory.features)))
                 if visualize and window is None:
                     causal=representative_figures(runner,dataset,plan,t,query,target,old_memory,full,folder/'vis'/'full',
-                        support=old_support,previous_pose=previous_pose,seed_lock=seed_lock)
+                        support=old_support,previous_pose=previous_pose,seed_lock=seed_lock,older_pose=older_pose)
                     dump_json(folder/'representative_interventions.json',causal)
                 last_target=cpu_target(target)
             if t%10==0:print(plan['name'],label,t,'/',len(plan['frame_ids'])-1,'memory',len(state.memory),'EPE',round(row['point_epe_m'],3),flush=True)

@@ -41,7 +41,7 @@ class WriteConfidence(nn.Module):
         nn.init.zeros_(self.modulation[-1].weight)
         nn.init.constant_(self.modulation[-1].bias, 1.)
 
-    def forward(self, depth, output):
+    def forward(self, depth, output, *, frontier_threshold=None):
         p = 1-output['dustbin_probability'].reshape_as(depth)
         c = output['c_depth'].reshape_as(depth)
         observed = output.get('rendered_T1', output.get('rendered'))
@@ -52,6 +52,8 @@ class WriteConfidence(nn.Module):
             opacity = observed.opacity[..., 0]
             variance = observed.depth_variance[..., 0]/observed.depth[..., 0].square().clamp_min(.04)
             residual = ((depth-observed.depth[..., 0])/observed.depth[..., 0].clamp_min(.2)).abs()
+            if frontier_threshold is not None:
+                residual = torch.where(opacity < frontier_threshold, 0., residual)
         attrs = torch.stack((p, c, depth.clamp_min(0).log1p(), opacity,
                              variance.clamp_max(10), residual.clamp_max(10)), -1)
         learned = self.modulation(attrs).sigmoid()[..., 0]

@@ -154,7 +154,8 @@ class VGGTSpatialMemory(nn.Module):
         return self.fusion(memory, reference_c2w=reference)
 
     def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False, read_jitter=None,
-                streaming=False, streaming_support=None, streaming_previous_pose=None, streaming_seed_lock=None):
+                streaming=False, streaming_support=None, streaming_previous_pose=None, streaming_seed_lock=None,
+                streaming_v4=False, streaming_older_pose=None):
         if type(query) is not QueryInput:
             raise TypeError("Query accepts only RGB/K, not supervision or camera pose")
         if read_jitter is not None and (not self.training or self.revision not in ('v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5')):
@@ -183,7 +184,13 @@ class VGGTSpatialMemory(nn.Module):
                 if self.revision in ('v2j', 'v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'):
                     query_tokens = torch.cat((shallow[0].float(), tokens.float()), -1) if self.revision in ('step2_v4', 'step2_v5') else shallow[0].float()
                     query_features = self.writer.latent(query_tokens)
-                    if streaming and streaming_previous_pose is not None:
+                    if streaming and streaming_v4:
+                        from src.models.stream_tracking_v4 import select_stream_pose_v4
+                        T0, bootstrap = select_stream_pose_v4(self, tokens.float(), shallow[0].float(),
+                            query_features, memory, Kp, hp, wp, streaming_previous_pose, streaming_older_pose,
+                            streaming_seed_lock)
+                        diagnostic['stream_query_features'] = query_features
+                    elif streaming and streaming_previous_pose is not None:
                         from src.models.stream_tracking import select_stream_pose
                         T0, bootstrap = select_stream_pose(self, tokens.float(), shallow[0].float(),
                             query_features, memory, Kp, hp, wp, streaming_previous_pose, streaming_seed_lock)
@@ -260,6 +267,12 @@ class VGGTSpatialMemory(nn.Module):
                     from src.readout.streaming_depth import anchor_streaming_geometry
                     camera_points, local_confidence, transport = anchor_streaming_geometry(self.render_reader, raw_camera_points, rendered_T1, K)
                     diagnostic.update(transport)
+                elif streaming and streaming_v4:
+                    from src.streaming_v4 import feature_reliability
+                    similarity, reliability = feature_reliability(rendered_T1, diagnostic['stream_query_features'])
+                    camera_points, local_confidence = self.render_reader.anchor_camera_geometry(
+                        raw_camera_points, rendered_T1, K, reliability=reliability)
+                    diagnostic['stream_feature_cosine'] = similarity
                 else:
                     camera_points, local_confidence = self.render_reader.anchor_camera_geometry(raw_camera_points if self.revision in ('step2_v4', 'step2_v5') else refinement_points, rendered_T1, K)
                 diagnostic['rendered_T1'] = rendered_T1

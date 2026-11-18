@@ -22,10 +22,14 @@ def stats(rows, field):
     return dict(mean=float(data.mean()), median=float(np.median(data)), p90=float(np.percentile(data, 90)))
 
 
-def compare(baseline, updated, destination, *, third=None):
+def compare(baseline, updated, destination, *, third=None, fourth=None):
     versions = {'v1': baseline, 'v2': updated}
     if third is not None:
         versions['v3'] = third
+    if fourth is not None:
+        if third is None:
+            raise ValueError('The eight-way comparison requires both v3 and v4')
+        versions['v4'] = fourth
     latest = next(reversed(versions))
     prefix = '_'.join(versions)
     labels = [f'{version} {variant}' for version in versions for variant in ('Full', 'W4')]
@@ -74,9 +78,17 @@ def compare(baseline, updated, destination, *, third=None):
                                            for r, c in zip(current, checks)),
                     wrong_high_write_frames=sum(r['translation1_m'] > 1 and c['mean_confidence'] > .4 and c['candidates'] > 0
                                                 for r, c in zip(current, checks)))
+                if 'effective_confidence' in checks[0]:
+                    metrics['write_diagnostics'].update(
+                        mean_support_multiplier=float(np.mean([c['support_multiplier'] for c in checks])),
+                        wrong_high_effective_write_frames=sum(
+                            r['translation1_m'] > 1 and c['effective_confidence'] > .4 and c['candidates'] > 0
+                            for r,c in zip(current,checks)))
             entry['variants'][label] = metrics
         if plan['kind'].startswith('natural') and 'harvard_c11' in plan['scene']:
             entry['return_frames'] = {label:[r for r in current if r['frame_id'] in (781,797)] for label,current in rows.items()}
+        if plan['kind'].startswith('natural') and 'robotics' in plan['scene']:
+            entry['robotics_frames'] = {label:[r for r in current if r['frame_id'] in (68,362)] for label,current in rows.items()}
         results.append(entry)
         details[plan['name']] = rows
     counts = {key:len(rows) for key,rows in total.items()}
@@ -110,7 +122,7 @@ def compare(baseline, updated, destination, *, third=None):
         data=details[plan['name']]
         target=np.array([r['target_c2w'] for r in data['v2 Full']])[:,:3,3]
         ax.plot(target[:,0],target[:,2],color='.45',lw=2,label='GT; evaluation only')
-        colors = dict(zip(versions, ('#e88a28','#1478af','#23914d')))
+        colors = dict(zip(versions, ('#e88a28','#1478af','#23914d','#933d9a')))
         for label in labels:
             version, variant = label.split()
             color = colors[version]
@@ -125,7 +137,8 @@ def compare(baseline, updated, destination, *, third=None):
     fig,axes=plt.subplots(len(plans),3,figsize=(17,3.3*len(plans)),squeeze=False)
     for axrow,plan in zip(axes,plans):
         current=details[plan['name']][f'{latest} Full'];ts=[r['t'] for r in current]
-        for field,label in (('rigid_consensus','Rigid inlier fraction'),('feature_cosine','Rendered/query latent cosine'),('frame_quality','Write quality')):
+        for field,label in (('rigid_consensus','Rigid inlier fraction'),('feature_cosine','Rendered/query latent cosine'),
+                            ('frame_quality','Write quality'),('support_multiplier','Write support multiplier')):
             if field in current[0]['write_checks']:
                 axrow[0].plot(ts,[r['write_checks'][field] for r in current],label=label)
         axrow[1].bar(ts,[r['write_checks']['candidates'] for r in current],color='#1478af',label='Predicted Gaussian candidates')
@@ -182,10 +195,13 @@ def main():
     parser.add_argument('--baseline', default='results/step3_streaming_seed17')
     parser.add_argument('--updated', default='results/step3_v2_seed17')
     parser.add_argument('--third', help='Optional v3 run for the six-way comparison')
+    parser.add_argument('--fourth',help='Optional v4 run for the eight-way comparison')
     args = parser.parse_args()
     third = PROJECT_ROOT/args.third if args.third else None
-    output = third/'comparison_versions' if third else PROJECT_ROOT/args.updated/'comparison_v1'
-    result = compare(PROJECT_ROOT/args.baseline, PROJECT_ROOT/args.updated, output, third=third)
+    fourth = PROJECT_ROOT/args.fourth if args.fourth else None
+    latest = fourth or third
+    output = latest/'comparison_versions' if latest else PROJECT_ROOT/args.updated/'comparison_v1'
+    result = compare(PROJECT_ROOT/args.baseline, PROJECT_ROOT/args.updated, output, third=third,fourth=fourth)
     print(json.dumps(dict(counts=result['counts'], aggregate=result['aggregate']), indent=2))
 
 

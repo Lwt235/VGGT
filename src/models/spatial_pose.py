@@ -234,17 +234,7 @@ class SpatialBootstrap(nn.Module):
         confidence = raw[:, 1].sigmoid()
         return rays/dz[:, None]*z[:, None], z, confidence, rays
 
-    def forward(self, tokens_pre_inject, query_features, memory, K, height, width, *, shallow,
-                match_mask=None, init_pose=None, matching_prior=None):
-        points, z, c_depth, rays = self.camera_observation(tokens_pre_inject, shallow, K, height, width)
-        count = len(points)
-        eye = torch.eye(4, device=K.device, dtype=K.dtype)
-        if not len(memory):
-            return eye, dict(anchors=points.new_zeros(count, 3), confidence=z*0.,
-                camera_patch_points=points, z_cam=z, c_depth=c_depth,
-                matching_attention=points.new_ones(count, 1), dustbin_probability=z*0.+1,
-                bootstrap_attention=points.new_zeros(count, 0), bootstrap_support=torch.zeros(0, device=z.device, dtype=torch.bool),
-                anchor_votes=z*0., match_mass=z.new_zeros(()))
+    def matching_logits(self, tokens_pre_inject, shallow, query_features, memory, rays):
         # Rotation-invariant covariance summaries; no eigen/SVD pose path.
         covariance = memory.covars
         trace = covariance.diagonal(dim1=-2, dim2=-1).sum(-1)
@@ -257,13 +247,27 @@ class SpatialBootstrap(nn.Module):
         q = F.normalize(query_features+self.query_residual(torch.cat((tokens_pre_inject, shallow, rays) if self.metric_scale else (shallow, rays), -1)), dim=-1)
         k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
         logits = q @ k.T*self.log_temperature.exp().clamp(max=60.)+memory.alpha.clamp_min(1e-6).log()[None]
+        dustbin = self.dustbin_logit.expand(len(rays), 1)
+        if self.ray_bundle:
+            dustbin = dustbin+self.dustbin_head(torch.cat((tokens_pre_inject, shallow), -1))
+        return logits, dustbin, q, k
+
+    def forward(self, tokens_pre_inject, query_features, memory, K, height, width, *, shallow,
+                match_mask=None, init_pose=None, matching_prior=None):
+        points, z, c_depth, rays = self.camera_observation(tokens_pre_inject, shallow, K, height, width)
+        count = len(points)
+        eye = torch.eye(4, device=K.device, dtype=K.dtype)
+        if not len(memory):
+            return eye, dict(anchors=points.new_zeros(count, 3), confidence=z*0.,
+                camera_patch_points=points, z_cam=z, c_depth=c_depth,
+                matching_attention=points.new_ones(count, 1), dustbin_probability=z*0.+1,
+                bootstrap_attention=points.new_zeros(count, 0), bootstrap_support=torch.zeros(0, device=z.device, dtype=torch.bool),
+                anchor_votes=z*0., match_mass=z.new_zeros(()))
+        logits, dustbin, q, k = self.matching_logits(tokens_pre_inject, shallow, query_features, memory, rays)
         if matching_prior is not None:
             logits = logits+matching_prior
         if match_mask is not None:
             logits = logits.masked_fill(~match_mask[None], -80.)
-        dustbin = self.dustbin_logit.expand(count, 1)
-        if self.ray_bundle:
-            dustbin = dustbin+self.dustbin_head(torch.cat((tokens_pre_inject, shallow), -1))
         W = torch.cat((logits, dustbin), -1).softmax(-1)
         p_match = 1-W[:, -1]
         inlier = W[:, :-1]/p_match[:, None].clamp_min(1e-6)

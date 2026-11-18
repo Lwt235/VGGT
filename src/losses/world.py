@@ -149,6 +149,14 @@ def open_set_matching_loss(output, target, erased_reference=None):
     return match, anchor, support_rate, observable
 
 
+def seed_partial_matching_loss(auxiliary, target, overlap):
+    """Only the criterion can enable a seed-target term at >=10% real overlap."""
+    if auxiliary is None or overlap is None or overlap < .10:
+        return target.depth.new_zeros(()),False
+    loss,_,_,_ = open_set_matching_loss(auxiliary,target)
+    return loss,True
+
+
 def world_loss(output, target, *, camera_weight=.5, refinement_safety_weight=0., anchor_weight=.2, matching_weight=.2, depth_weight=1., relative_depth_weight=0., anchored_camera_weight=0., anchored_relative_depth_weight=0.):
     if 'matching_attention' not in output:
         return _legacy_world_loss(output, target, camera_weight=camera_weight, refinement_safety_weight=refinement_safety_weight,

@@ -46,16 +46,19 @@ class TrajectorySegment(nn.Module):
         self.criterion = criterion
         self.config = config
 
-    def forward(self, frames, state, seed, total_queries):
+    def forward(self, frames, state, seed, total_queries, seed_overlaps=None):
         from src.streaming_v2 import detach_state
         engine = self._engine
         if seed is not None:
             query, truth = seed
             state = engine.seed(query, truth.depth, truth.valid)
         losses, measurements, sizes, writes, active = [], [], [], [], []
-        for query, target in frames:
+        for i,(query,target) in enumerate(frames):
             output, state = engine(query, state)
-            loss, metrics = self.criterion(output, target, self.config)
+            if seed_overlaps is None:
+                loss,metrics = self.criterion(output,target,self.config)
+            else:
+                loss,metrics = self.criterion(output,target,self.config,seed_surface_overlap=seed_overlaps[i])
             losses.append(loss)
             measurements.append(metrics)
             sizes.append(len(state.memory))
