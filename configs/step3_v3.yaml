@@ -1,0 +1,36 @@
+seed: 17
+architecture_revision: step2_v5
+initialization: step2_full_18000_spatial_adaptation
+base_checkpoint: results/step2_v5_full_seed17/training_state_18000.pt
+split: configs/step2_splits.yaml
+steps: 1500
+image_hw:
+- 168
+- 224
+receive_layer: 4
+minimum_frames: 12
+maximum_frames: 16
+native_frozen: true
+camera_alignment_weight: 0.05
+anchored_camera_weight: 0.2
+anchored_relative_depth_weight: 0.2
+patch_depth_weight: 2.0
+relative_depth_weight: 0.2
+anchor_alignment_weight: 1.0
+matching_weight: 1.0
+refinement_safety_weight: 2.0
+optimizer:
+  heads_lr: 5.0e-05
+  pose_lr: 2.0e-05
+  bootstrap_lr: 2.0e-05
+  gate_lr: 0.0001
+  warmup_steps: 100
+  end_lr_ratio: 0.1
+  grad_clip: 5.0
+log_every: 25
+checkpoint_every: 250
+checkpoint_policy: atomic_latest_plus_final_hardlink_only
+training_gauge: seed camera c2w_0=I; later GT is criterion only
+description: Locked seed geometry, v1 metric anchoring and write gate, local tracking and seed relocalization.
+streaming_revision: v3
+tbptt_frames: 5

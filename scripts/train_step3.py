@@ -50,7 +50,10 @@ def load_engine(config, checkpoint=None, device='cuda'):
     # StreamingMomentFusion is a separate stateful moment update module; the
     # offline mapping fusion is only its immutable Full18k initialization.
     model.fusion.requires_grad_(False)
-    if config.get('streaming_revision') == 'v2':
+    if config.get('streaming_revision') == 'v3':
+        from src.streaming_v3 import StreamingEngineV3
+        engine = StreamingEngineV3(model)
+    elif config.get('streaming_revision') == 'v2':
         from src.streaming_v2 import StreamingEngineV2
         engine = StreamingEngineV2(model)
     else:
@@ -224,8 +227,9 @@ def main():
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank, local_rank = int(os.environ.get('RANK', '0')), int(os.environ.get('LOCAL_RANK', '0'))
     distributed = world_size > 1
-    if distributed and config.get('streaming_revision') != 'v2':
-        parser.error('DDP requires the detachable v2 3D streaming state')
+    long_stream = config.get('streaming_revision') in ('v2', 'v3')
+    if distributed and not long_stream:
+        parser.error('DDP requires the detachable long-stream 3D state')
     torch.cuda.set_device(local_rank)
     if distributed:
         import torch.distributed as dist
@@ -240,11 +244,12 @@ def main():
     if distributed:
         dist.barrier(device_ids=[local_rank])
     dataset_type = StreamingDataset
-    if config.get('streaming_revision') == 'v2':
+    if long_stream:
         from src.streaming_data_v2 import StridedStreamingDataset
         dataset_type = StridedStreamingDataset
+    options = {'jump_revisits': True} if config.get('streaming_revision') == 'v3' else {}
     dataset = dataset_type(PROJECT_ROOT/config['split'], config['image_hw'],
-        config['minimum_frames'], config['maximum_frames'])
+        config['minimum_frames'], config['maximum_frames'], **options)
     engine = load_engine(config, device=f'cuda:{local_rank}').train()
     require_checkpoint_space(folder, engine, initial=not args.resume)
     optimizer, scheduler = build_optimizer(engine, config)
@@ -336,7 +341,7 @@ def main():
                         segment.backward()
                         detached_losses.extend(x.detach() for x in losses)
                         losses.clear()
-                        if config.get('streaming_revision') == 'v2':
+                        if long_stream:
                             from src.streaming_v2 import detach_state
                             state = detach_state(state)
                         del segment
@@ -360,7 +365,7 @@ def main():
                 mean_write_confidence=float(np.mean([r['mean_confidence'] for r in writes])),
                 mean_frame_write_quality=float(np.mean([r['frame_quality'] for r in writes])),
                 mean_written_candidates=float(np.mean([r['candidates'] for r in writes])),
-                write_checks=writes if config.get('streaming_revision') == 'v2' else None,
+                write_checks=writes if long_stream else None,
                 mean_observation_support=float(state.support.detach().mean()) if len(state.support) else 0.,
                 peak_allocated_gib=torch.cuda.max_memory_allocated()/2**30,
                 peak_reserved_gib=torch.cuda.max_memory_reserved()/2**30,

@@ -129,8 +129,11 @@ def display_shells(folder,scene,memory,max_shells=256):
 
 
 @torch.no_grad()
-def read_only(engine,query,memory,*,return_attention=False,support=None):
+def read_only(engine,query,memory,*,return_attention=False,support=None,previous_pose=None,seed_lock=None):
     if hasattr(engine,'read'):
+        if previous_pose is not None:
+            return engine.read(query,memory,return_attention=return_attention,
+                               previous_pose=previous_pose,seed_lock=seed_lock)
         if support is not None:
             return engine.read(query,memory,return_attention=return_attention,support=support)
         return engine.read(query,memory,return_attention=return_attention)
@@ -138,14 +141,17 @@ def read_only(engine,query,memory,*,return_attention=False,support=None):
 
 
 @torch.no_grad()
-def representative_figures(engine,dataset,plan,t,query,target,memory,full,folder,*,support=None):
+def representative_figures(engine,dataset,plan,t,query,target,memory,full,folder,*,support=None,
+                           previous_pose=None,seed_lock=None):
     """Interventions are read-only branches, never committed into the stream."""
     from scripts.train_step2 import intervention_box,erasure_metrics
     from src.vis.smoke import v1,v3,v4,v5
     folder.mkdir(parents=True,exist_ok=True)
-    empty=read_only(engine,query,memory.subset(slice(0,0)),support=None if support is None else support[:0])
+    empty=read_only(engine,query,memory.subset(slice(0,0)),support=None if support is None else support[:0],
+                    previous_pose=previous_pose,seed_lock=None if seed_lock is None else seed_lock[:0])
     box=intervention_box(memory,target);partial,mask=memory.erase_box(*box)
-    erased=read_only(engine,query,partial,support=None if support is None else support[~mask])
+    erased=read_only(engine,query,partial,support=None if support is None else support[~mask],
+                     previous_pose=previous_pose,seed_lock=None if seed_lock is None else seed_lock[~mask])
     # Reload only one seed for this offline figure. No engine ever stores it.
     seed=next(iter(dataset.load_stream(plan['scene'],[plan['frame_ids'][0]],device=query.rgb.device)['observations']))
     scene=dict(name=plan['name']+f' / t={t}; pre-write map',mapping=[seed])
@@ -184,6 +190,8 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
         for t,(query,target) in enumerate(observations,1):
             old_memory=state.memory
             old_support=state.support if hasattr(state,'seed_lock') else None
+            previous_pose=getattr(state,'prev_pose',None)
+            seed_lock=getattr(state,'seed_lock',None)
             full,state=runner(query,state,return_attention=visualize and t==representative and window is None)
             if window is None:gt_surfaces.append(target.world_points[target.valid][::4].detach().float().cpu().numpy())
             row=dict(t=t,frame_id=plan['frame_ids'][t],phase=plan['phases'][t],memory_before=len(old_memory),memory_after=len(state.memory),
@@ -205,7 +213,8 @@ def evaluate_plan(engine,dataset,plan,folder,*,visualize=True):
                 map_snapshots[label]=GaussianMemory(*(value.detach().float().cpu() for value in
                     (old_memory.means,old_memory.covars,old_memory.alpha,old_memory.features)))
                 if visualize and window is None:
-                    causal=representative_figures(runner,dataset,plan,t,query,target,old_memory,full,folder/'vis'/'full',support=old_support)
+                    causal=representative_figures(runner,dataset,plan,t,query,target,old_memory,full,folder/'vis'/'full',
+                        support=old_support,previous_pose=previous_pose,seed_lock=seed_lock)
                     dump_json(folder/'representative_interventions.json',causal)
                 last_target=cpu_target(target)
             if t%10==0:print(plan['name'],label,t,'/',len(plan['frame_ids'])-1,'memory',len(state.memory),'EPE',round(row['point_epe_m'],3),flush=True)

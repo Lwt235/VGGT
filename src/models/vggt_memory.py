@@ -154,7 +154,7 @@ class VGGTSpatialMemory(nn.Module):
         return self.fusion(memory, reference_c2w=reference)
 
     def forward(self, query: QueryInput, memory: GaussianMemory, *, return_attention=False, read_jitter=None,
-                streaming=False, streaming_support=None):
+                streaming=False, streaming_support=None, streaming_previous_pose=None, streaming_seed_lock=None):
         if type(query) is not QueryInput:
             raise TypeError("Query accepts only RGB/K, not supervision or camera pose")
         if read_jitter is not None and (not self.training or self.revision not in ('v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5')):
@@ -182,12 +182,18 @@ class VGGTSpatialMemory(nn.Module):
             with torch.autocast(device_type=rgb.device.type, enabled=False):
                 if self.revision in ('v2j', 'v2k', 'v2l', 'step2', 'step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'):
                     query_tokens = torch.cat((shallow[0].float(), tokens.float()), -1) if self.revision in ('step2_v4', 'step2_v5') else shallow[0].float()
-                    T0, bootstrap = self.initial_pose(tokens.float(), self.writer.latent(query_tokens),
-                                                     memory, Kp, hp, wp, shallow=shallow[0].float())
-                    if streaming and streaming_support is not None and len(memory):
+                    query_features = self.writer.latent(query_tokens)
+                    if streaming and streaming_previous_pose is not None:
+                        from src.models.stream_tracking import select_stream_pose
+                        T0, bootstrap = select_stream_pose(self, tokens.float(), shallow[0].float(),
+                            query_features, memory, Kp, hp, wp, streaming_previous_pose, streaming_seed_lock)
+                    else:
+                        T0, bootstrap = self.initial_pose(tokens.float(), query_features,
+                                                         memory, Kp, hp, wp, shallow=shallow[0].float())
+                    if streaming and streaming_support is not None and streaming_previous_pose is None and len(memory):
                         from src.models.stream_landmarks import select_landmark_pose
                         T0, bootstrap = select_landmark_pose(self, tokens.float(), shallow[0].float(),
-                            self.writer.latent(query_tokens), memory, streaming_support, Kp, hp, wp, T0, bootstrap)
+                            query_features, memory, streaming_support, Kp, hp, wp, T0, bootstrap)
                     diagnostic.update(bootstrap)
                     if streaming:
                         # Current-frame scratch only: consumed by the writer,
@@ -250,7 +256,7 @@ class VGGTSpatialMemory(nn.Module):
             if self.render_reader is not None and self.revision in ('step2_v2', 'step2_v3', 'step2_v4', 'step2_v5'):
                 final_pose = T1.detach() if self.revision in ('step2_v3', 'step2_v4', 'step2_v5') else T1
                 rendered_T1 = self.render_reader.render(memory, final_pose, Kp, hp, wp)
-                if streaming and streaming_support is not None:
+                if streaming and streaming_support is not None and streaming_previous_pose is None:
                     from src.readout.streaming_depth import anchor_streaming_geometry
                     camera_points, local_confidence, transport = anchor_streaming_geometry(self.render_reader, raw_camera_points, rendered_T1, K)
                     diagnostic.update(transport)

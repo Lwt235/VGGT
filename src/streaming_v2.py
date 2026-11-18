@@ -4,7 +4,7 @@ The additional state is one scalar support and lock flag per 3D primitive and
 the last accepted write's predicted pose. There is no image, token grid or KV.
 The original StreamingEngine remains the immutable v1 execution path.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -31,9 +31,10 @@ def detached_memory(memory):
 
 def detach_state(state):
     """TBPTT cuts the graph, never the public spatial memory or write history."""
-    return StreamingStateV2(detached_memory(state.memory), state.support.detach(), state.step,
-        tuple(SpatialWrite(detached_memory(e.memory), e.support.detach(), e.step) for e in state.window_entries),
-        state.seed_lock, None if state.last_write_pose is None else state.last_write_pose.detach())
+    tracking = {'prev_pose': state.prev_pose.detach()} if hasattr(state, 'prev_pose') else {}
+    return replace(state, memory=detached_memory(state.memory), support=state.support.detach(),
+        window_entries=tuple(SpatialWrite(detached_memory(e.memory), e.support.detach(), e.step) for e in state.window_entries),
+        last_write_pose=None if state.last_write_pose is None else state.last_write_pose.detach(), **tracking)
 
 
 def locked_fusion(fusion, memory, support, candidates, candidate_support, seed_lock):
@@ -110,6 +111,23 @@ class StreamingEngineV2(StreamingEngine):
         output.pop('stream_writer_tokens', None)
         return output
 
+    def fuse_write(self, state, candidates, candidate_support):
+        step = state.step+1
+        if not self.window:
+            memory, support, lock = locked_fusion(
+                self.fusion, state.memory, state.support, candidates, candidate_support, state.seed_lock)
+            return memory, support, lock, ()
+        entries = tuple(e for e in state.window_entries if e.step > step-self.window)
+        entries += (SpatialWrite(candidates, candidate_support, step),)
+        memory, support = empty_like(state.memory), state.support[:0]
+        lock = torch.zeros(0, device=support.device, dtype=torch.bool)
+        for entry in entries:
+            memory, support, lock = locked_fusion(self.fusion, memory, support, entry.memory, entry.support, lock)
+            if entry.step == 0:
+                support = torch.full_like(support, self.fusion.support_cap)
+                lock = torch.ones(len(memory), device=support.device, dtype=torch.bool)
+        return memory, support, lock, entries
+
     def forward(self, query: QueryInput, state: StreamingStateV2, *, return_attention=False):
         if type(query) is not QueryInput or type(state) is not StreamingStateV2:
             raise TypeError('Streaming v2 accepts only RGB/K and spatial state')
@@ -132,18 +150,7 @@ class StreamingEngineV2(StreamingEngine):
         candidates = self.model.writer(tokens, depth, patch_intrinsics(query.K), output['T1'], valid_mask=keep)
         candidate_support = confidence[keep]*fraction[keep]*candidates.alpha
         step = state.step+1
-        if self.window:
-            entries = tuple(e for e in state.window_entries if e.step > step-self.window)+(SpatialWrite(candidates, candidate_support, step),)
-            memory, support = empty_like(state.memory), state.support[:0]
-            lock = torch.zeros(0, device=support.device, dtype=torch.bool)
-            for entry in entries:
-                memory, support, lock = locked_fusion(self.fusion, memory, support, entry.memory, entry.support, lock)
-                if entry.step == 0:
-                    support = torch.full_like(support, self.fusion.support_cap)
-                    lock = torch.ones(len(memory), device=support.device, dtype=torch.bool)
-        else:
-            entries = ()
-            memory, support, lock = locked_fusion(self.fusion, state.memory, state.support, candidates, candidate_support, state.seed_lock)
+        memory, support, lock, entries = self.fuse_write(state, candidates, candidate_support)
         last_pose = pose if len(candidates) else state.last_write_pose
         output.update(write_confidence=confidence, frame_write_quality=quality,
             active_count=len(output['attention']['indices']), write=dict(candidates=len(candidates),

@@ -234,7 +234,8 @@ class SpatialBootstrap(nn.Module):
         confidence = raw[:, 1].sigmoid()
         return rays/dz[:, None]*z[:, None], z, confidence, rays
 
-    def forward(self, tokens_pre_inject, query_features, memory, K, height, width, *, shallow, match_mask=None):
+    def forward(self, tokens_pre_inject, query_features, memory, K, height, width, *, shallow,
+                match_mask=None, init_pose=None, matching_prior=None):
         points, z, c_depth, rays = self.camera_observation(tokens_pre_inject, shallow, K, height, width)
         count = len(points)
         eye = torch.eye(4, device=K.device, dtype=K.dtype)
@@ -256,6 +257,8 @@ class SpatialBootstrap(nn.Module):
         q = F.normalize(query_features+self.query_residual(torch.cat((tokens_pre_inject, shallow, rays) if self.metric_scale else (shallow, rays), -1)), dim=-1)
         k = F.normalize(memory.features+self.key_residual(torch.cat((memory.features, scales, memory.alpha[:, None]), -1)), dim=-1)
         logits = q @ k.T*self.log_temperature.exp().clamp(max=60.)+memory.alpha.clamp_min(1e-6).log()[None]
+        if matching_prior is not None:
+            logits = logits+matching_prior
         if match_mask is not None:
             logits = logits.masked_fill(~match_mask[None], -80.)
         dustbin = self.dustbin_logit.expand(count, 1)
@@ -271,7 +274,9 @@ class SpatialBootstrap(nn.Module):
             from src.models.ellipsoid_pose import posterior_ellipsoids, anisotropic_ray_pose
             anchors, covariance = posterior_ellipsoids(inlier, memory, isotropic=self.isotropic)
             weights = p_match*c_depth
-            T, votes, lm = anisotropic_ray_pose(points, rays, anchors, covariance, weights, return_diagnostic=True, metric_scale=self.metric_scale, planar_safe=self.planar_safe)
+            T, votes, lm = anisotropic_ray_pose(points, rays, anchors, covariance, weights,
+                return_diagnostic=True, metric_scale=self.metric_scale, planar_safe=self.planar_safe,
+                init_pose=init_pose)
             extras = dict(posterior_covars=covariance, lm_energy_history=lm['energy_history'],
                           lm_accepted_scales=lm['accepted_scales'])
         else:
@@ -281,16 +286,18 @@ class SpatialBootstrap(nn.Module):
         # fallback in the unobservable regime is intentionally not gauge equivariant.
         quality = ((p_match.sum()-.25)/.025).sigmoid()
         quality = quality*p_match.sum()/(p_match.sum()+1e-8)
-        mixed_R = rotation_6d(torch.cat((quality*T[:3, 0]+(1-quality)*eye[:3, 0],
-                                       quality*T[:3, 1]+(1-quality)*eye[:3, 1])))
-        top = torch.cat((mixed_R, (quality*T[:3, 3])[:, None]), -1)
+        fallback = eye if init_pose is None else init_pose
+        mixed_R = rotation_6d(torch.cat((quality*T[:3, 0]+(1-quality)*fallback[:3, 0],
+                                       quality*T[:3, 1]+(1-quality)*fallback[:3, 1])))
+        top = torch.cat((mixed_R, (quality*T[:3, 3]+(1-quality)*fallback[:3, 3])[:, None]), -1)
         T = torch.cat((top, eye[3:]), 0)
         return T, dict(anchors=anchors, confidence=p_match, camera_patch_points=points, z_cam=z, c_depth=c_depth,
             matching_attention=W, dustbin_probability=W[:, -1], bootstrap_attention=inlier,
             bootstrap_support=(torch.ones(len(memory), device=z.device, dtype=torch.bool) if match_mask is None else match_mask),
             anchor_votes=votes, match_mass=p_match.sum(), matching_query=q, matching_keys=k,
             matching_dustbin_logit=dustbin, matching_temperature=self.log_temperature.exp().clamp(max=60.),
-            camera_rays=rays, **({'matching_mask': match_mask} if match_mask is not None else {}), **extras)
+            camera_rays=rays, **({'matching_mask': match_mask} if match_mask is not None else {}),
+            **({'matching_prior': matching_prior} if matching_prior is not None else {}), **extras)
 
 
 class SpatialRefinement(nn.Module):
